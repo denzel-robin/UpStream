@@ -11,6 +11,7 @@ from upstream_vsr.model import UpStreamVSR, warp  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
 from prepare_streamsr import is_informative  # noqa: E402
+from train_upstream import endless  # noqa: E402
 
 
 def inputs(scale, batch=2, seed=0):
@@ -146,3 +147,15 @@ def test_static_and_blank_windows_are_rejected():
     assert not is_informative(np.repeat(textured, 4, axis=0))  # frozen
     assert not is_informative(np.full((4, 16, 16, 3), 128, np.uint8))  # blank
     assert is_informative(rng.integers(0, 255, (4, 16, 16, 3), dtype=np.uint8))  # changing
+
+
+def test_endless_loader_starts_a_new_pass_each_epoch():
+    passes = []
+
+    class Loader:
+        def __iter__(self):
+            passes.append(1)
+            return iter([len(passes)])
+
+    stream = endless(Loader())
+    assert [next(stream) for _ in range(3)] == [1, 2, 3]

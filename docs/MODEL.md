@@ -83,37 +83,52 @@ the training path works. It says nothing about generalization.
 | Recurrent state, deepest exit | 27.84 |
 | Recurrent state, trained on random exits | 28.19 |
 
+Held-out test: 3,000 iterations on 16 windows from 5 clips, scored on 3 windows from
+1 unseen clip. This is far too little data to judge final quality. It only shows that
+the model can beat bicubic on video it has not seen.
+
+| Method | x2 PSNR | x4 PSNR |
+|---|---:|---:|
+| Bilinear | 24.17 | 21.55 |
+| Bicubic | 24.96 | 21.84 |
+| 3 blocks | 25.29 | 22.01 |
+| 6 blocks | 25.25 | 21.90 |
+| 9 blocks | 25.20 | 21.94 |
+| 9 blocks, state reset every frame | 25.18 | 22.00 |
+
 ## Open risks
 
-1. **Recurrent state is not yet shown to help.** In the test above it scored about
-   0.9 dB below no state. An overfitting test favours memorizing single frames, so
-   this is not conclusive, but the temporal path has to beat no-state on held-out
-   video or the design needs to change. This is the first thing to check after training.
-2. **Held-out quality is unknown.** The only held-out run predates the head fix and
-   stayed below bicubic.
+1. **Recurrent state is not yet shown to help.** In the table above it makes no clear
+   difference, and in the overfitting test it scored about 0.9 dB below no state. The
+   temporal path has to beat no-state on held-out video after full training, or the
+   design needs to change. This is the first thing to check.
+2. **Extra depth is not yet shown to help.** All three exits score about the same.
+   Anytime depth is only useful if deeper exits become measurably better with full training.
 3. **Direct delivery may still win.** The earlier study found it beat NanoVSR at matched
    rates at 360p playback. The real test is rate-quality against direct delivery at 720p.
-4. **BatchNorm:** eval-mode scores sit about 1 dB below train-mode in this tiny test.
+4. **BatchNorm:** eval-mode scores sat about 1 dB below train-mode in the overfitting test.
    Recheck at full batch sizes.
 
-## Training in the cloud
+## Training on Kaggle
 
-Dataset links are in the [EfRLFN repository](https://github.com/EvgeneyBogatyrev/EfRLFN)
-(`youtube-train.tar.gz`, 12 GB; `subjective-set.tar.gz`, 437 MB). The paper describes
-the videos as CC BY 4.0; do not commit them here. The commands below have only been
-run on a seven-clip sample, not the full archive.
+The two notebooks in `kaggle/` call `scripts/kaggle_run.py`. Upload them to Kaggle and
+run each with **Save Version > Save & Run All**, because an interactive session loses its
+output when it stops. Internet must be on, which requires a phone-verified Kaggle account.
 
-```bash
-pip install -r requirements-train.txt
-tar xzf youtube-train.tar.gz && tar xzf subjective-set.tar.gz
-python scripts/prepare_streamsr.py youtube-GPT-queries data/streamsr
-python scripts/prepare_streamsr.py subjective-set data/streamsr --split test
-python scripts/train_upstream.py data/streamsr runs/main
-```
+1. **`kaggle/1_prepare_data.ipynb`**, Accelerator **None**. Downloads StreamSR (links from
+   the [EfRLFN repository](https://github.com/EvgeneyBogatyrev/EfRLFN)), processes up to
+   2,000 clips and writes `streamsr-windows.tar`. It stops by itself after 8 hours and tars
+   whatever is done.
+2. **`kaggle/2_train.ipynb`**, Accelerator **GPU T4 x2**, with notebook 1's output attached
+   under **Add Input**. It trains for up to 8 hours, then writes `run/` with checkpoints
+   and `evaluation.json`. To continue, also attach its previous output and run it again.
 
-Rerunning the same `train_upstream.py` command resumes from `runs/main/latest.pt`, and
-`prepare_streamsr.py` skips clips already listed in its manifest. Keep `runs/` on
-persistent storage, because Colab and Kaggle sessions end without warning.
+Tested locally with stand-in archives and a fake Kaggle directory, including resuming and
+stopping at the time limit. Not yet tested on Kaggle itself or with the real download. The
+paper describes the videos as CC BY 4.0; do not commit them here.
+
+To train elsewhere, use `scripts/prepare_streamsr.py` and `scripts/train_upstream.py`
+directly. Score a checkpoint with `scripts/evaluate_upstream.py`.
 
 ## Tests
 

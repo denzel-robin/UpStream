@@ -8,7 +8,6 @@ import math
 import random
 import sys
 import time
-from itertools import cycle
 from pathlib import Path
 
 import torch
@@ -18,6 +17,16 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from upstream_vsr.data import WindowDataset  # noqa: E402
 from upstream_vsr.model import UpStreamVSR  # noqa: E402
+
+
+def endless(loader):
+    """Loop over a DataLoader, reshuffling and re-augmenting each epoch.
+
+    itertools.cycle must not be used here: it replays stored first-epoch batches
+    and keeps them all in memory.
+    """
+    while True:
+        yield from loader
 
 
 def charbonnier(prediction: torch.Tensor, target: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
@@ -100,6 +109,7 @@ def main() -> None:
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--val-every', type=int, default=2000)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--max-hours', type=float, help='save and exit cleanly after this long')
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -139,10 +149,14 @@ def main() -> None:
 
     log = (args.output / 'log.jsonl').open('a')
     exits_to_check = sorted({0, len(args.exits) - 1})
-    started = time.monotonic()
+    session_start = started = time.monotonic()
     model.train()
-    for batch in cycle(train_loader):
+    for batch in endless(train_loader):
         if iteration >= args.iterations:
+            break
+        if args.max_hours and time.monotonic() - session_start > args.max_hours * 3600:
+            save(latest)
+            print(f'time budget reached at iteration {iteration}; saved {latest}', flush=True)
             break
         batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
         optimizer.zero_grad(set_to_none=True)

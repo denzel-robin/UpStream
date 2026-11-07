@@ -14,20 +14,24 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import multiprocessing
+import os
 import random
 import subprocess
 import sys
 import tempfile
+import time
 from fractions import Fraction
 from pathlib import Path
 
+import av
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from upstream_vsr.codec import decode_with_motion  # noqa: E402
 
 CRFS = (18, 23, 28, 33)
-X264 = ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-threads', '4',
+X264 = ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-threads', '1',
         '-x264-params', 'keyint=30:min-keyint=30:scenecut=0:bframes=0:ref=1',
         '-pix_fmt', 'yuv420p', '-colorspace', 'bt709', '-color_primaries', 'bt709',
         '-color_trc', 'bt709', '-color_range', 'tv']
@@ -128,6 +132,39 @@ def split_for(clip_id: str, requested: str | None) -> str:
     return 'val' if int(hashlib.md5(clip_id.encode()).hexdigest(), 16) % 11 == 0 else 'train'
 
 
+def process_clip(job: tuple[Path, argparse.Namespace]) -> dict:
+    source, args = job
+    clip_id = source.name.split('@')[0]
+    rng = random.Random(f'{args.seed}:{clip_id}')
+    entry = {'clip': clip_id, 'status': 'ok', 'windows': 0}
+    info = probe(source)
+    # Vertical or non-16:9 clips would be distorted by the fixed 720p target.
+    if info is None:
+        entry['status'] = 'unreadable'
+    elif abs(info[0] / info[1] - 16 / 9) > .02:
+        entry['status'] = 'not-16:9'
+    elif info[2] < 23:
+        entry['status'] = 'low-fps'
+    else:
+        crf = rng.choice(CRFS)
+        entry.update(split=split_for(clip_id, args.split), crf=crf, fps=info[2])
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                paths = encode(source, Path(temp), crf, info[2], args.seconds)
+                windows = extract(paths, args.frames, args.windows_per_clip, args.patch, rng)
+        except (subprocess.CalledProcessError, ValueError, OSError, av.error.FFmpegError) as error:
+            entry['status'] = f'failed: {type(error).__name__}'
+        else:
+            target = args.output / entry['split']
+            target.mkdir(exist_ok=True)
+            for number, window in enumerate(windows):
+                np.savez_compressed(target / f'{clip_id}-{number}.npz', crf=crf, **window)
+            entry['windows'] = len(windows)
+            if not windows:
+                entry['status'] = 'no-informative-windows'
+    return entry
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('source', type=Path, help='directory containing <id>@1440.mp4 files')
@@ -139,6 +176,8 @@ def main() -> None:
     parser.add_argument('--seconds', type=float, default=6)
     parser.add_argument('--limit', type=int, help='process at most this many clips')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--workers', type=int, default=os.cpu_count())
+    parser.add_argument('--max-hours', type=float, help='stop cleanly after this long')
     args = parser.parse_args()
     if args.patch % 16:
         parser.error('--patch must be a multiple of 16')
@@ -150,44 +189,21 @@ def main() -> None:
     if manifest.exists():
         done = {json.loads(line)['clip'] for line in manifest.read_text().splitlines()}
 
-    counts = {'windows': 0, 'skipped': 0}
-    with manifest.open('a') as log:
-        for source in clips:
-            clip_id = source.name.split('@')[0]
-            if clip_id in done:
-                continue
-            rng = random.Random(f'{args.seed}:{clip_id}')
-            entry = {'clip': clip_id, 'status': 'ok', 'windows': 0}
-            info = probe(source)
-            # Vertical or non-16:9 clips would be distorted by the fixed 720p target.
-            if info is None:
-                entry['status'] = 'unreadable'
-            elif abs(info[0] / info[1] - 16 / 9) > .02:
-                entry['status'] = 'not-16:9'
-            elif info[2] < 23:
-                entry['status'] = 'low-fps'
-            else:
-                crf = rng.choice(CRFS)
-                entry.update(split=split_for(clip_id, args.split), crf=crf, fps=info[2])
-                try:
-                    with tempfile.TemporaryDirectory() as temp:
-                        paths = encode(source, Path(temp), crf, info[2], args.seconds)
-                        windows = extract(paths, args.frames, args.windows_per_clip, args.patch, rng)
-                except (subprocess.CalledProcessError, ValueError) as error:
-                    entry['status'] = f'failed: {type(error).__name__}'
-                else:
-                    target = args.output / entry['split']
-                    target.mkdir(exist_ok=True)
-                    for number, window in enumerate(windows):
-                        np.savez_compressed(target / f'{clip_id}-{number}.npz', crf=crf, **window)
-                    entry['windows'] = len(windows)
-                    if not windows:
-                        entry['status'] = 'no-informative-windows'
+    jobs = [(source, args) for source in clips if source.name.split('@')[0] not in done]
+    counts = {'windows': 0, 'skipped': 0, 'remaining': len(jobs)}
+    started = time.monotonic()
+    with manifest.open('a') as log, multiprocessing.Pool(args.workers) as pool:
+        for entry in pool.imap_unordered(process_clip, jobs):
             counts['windows'] += entry['windows']
             counts['skipped'] += entry['status'] != 'ok'
+            counts['remaining'] -= 1
             log.write(json.dumps(entry) + '\n')
             log.flush()
             print(entry, flush=True)
+            if args.max_hours and time.monotonic() - started > args.max_hours * 3600:
+                print('time budget reached; rerun to continue from the manifest', flush=True)
+                pool.terminate()
+                break
     print(counts)
 
 

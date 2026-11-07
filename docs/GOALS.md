@@ -28,7 +28,7 @@ Complete a live video upscaling pipeline that balances four things:
 ## Constraints
 
 - **Timeline:** due in about three months (around February 2027); finish sooner if possible.
-- **Training:** on rented cloud or Colab/Kaggle, so training must resume after interruptions.
+- **Training:** on Kaggle, so training must resume across sessions.
 - **Client hardware:** RTX 3050 Laptop, 4 GB VRAM.
 - **Live use:** no lookahead frames.
 
@@ -37,7 +37,7 @@ Complete a live video upscaling pipeline that balances four things:
 | # | Milestone | Status |
 |---|---|---|
 | 1 | Model, codec motion extraction, data preparation, training and benchmark scripts | Done |
-| 2 | Prepare the full StreamSR data and train in the cloud | Not started |
+| 2 | Prepare the full StreamSR data and train on Kaggle | In progress: notebooks ready, not yet run |
 | 3 | Live integration: motion vectors from the decoder, per-frame depth, separate reconstruction and display threads | Not started |
 | 4 | Trade-off controller with mid-stream resolution and bitrate switching | Not started |
 | 5 | Evaluation with shaped network conditions, ablation of each technique, sustained run | Not started |

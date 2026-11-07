@@ -1,4 +1,5 @@
-torch>=2.2
+torch>=2.3
 numpy
 av>=19
 pytest
+gdown
