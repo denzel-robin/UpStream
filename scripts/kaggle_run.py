@@ -14,11 +14,17 @@ KAGGLE_ROOT overrides /kaggle so this can be tested on another machine.
 from __future__ import annotations
 
 import argparse
+import html
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -34,11 +40,80 @@ def run(*command: object) -> None:
     subprocess.run([str(part) for part in command], check=True)
 
 
+def open_range(url: str, start: int):
+    request = urllib.request.Request(url, headers={'Range': f'bytes={start}-', 'User-Agent': 'Mozilla/5.0'})
+    response = urllib.request.urlopen(request, timeout=60)
+    if 'text/html' not in response.headers.get('Content-Type', ''):
+        return response
+    # Google Drive answers large files with a confirmation form instead of the data.
+    page = response.read(1_000_000).decode('utf-8', 'replace')
+    fields = dict(re.findall(r'name="(\w+)" value="([^"]*)"', page))
+    action = re.search(r'action="([^"]+)"', page)
+    if not action or 'confirm' not in fields:
+        title = re.search(r'<title>(.*?)</title>', page)
+        raise PermissionError(f'server sent a page, not the file: {title.group(1) if title else page[:200]}')
+    target = html.unescape(action.group(1)) + '?' + urllib.parse.urlencode(fields)
+    request = urllib.request.Request(target, headers={'Range': f'bytes={start}-', 'User-Agent': 'Mozilla/5.0'})
+    response = urllib.request.urlopen(request, timeout=60)
+    if 'text/html' in response.headers.get('Content-Type', ''):
+        raise PermissionError('server sent a page after confirmation; the download may be over quota')
+    return response
+
+
+def download(url: str, destination: Path, max_stalls: int = 8, retry_wait: float = 15) -> None:
+    """Download with retries, continuing from the bytes already received.
+
+    Only attempts that gain no data count toward max_stalls, so a long download
+    can survive any number of dropped connections as long as it keeps progressing.
+    """
+    partial = destination.with_name(destination.name + '.part')
+    stalls, next_report = 0, 0
+    while True:
+        position = partial.stat().st_size if partial.exists() else 0
+        total = None
+        try:
+            with open_range(url, position) as response:
+                if response.status == 206:
+                    total = int(response.headers['Content-Range'].rsplit('/', 1)[1])
+                else:  # the server ignored the range, so start over
+                    position = 0
+                    total = int(response.headers.get('Content-Length') or 0) or None
+                with partial.open('r+b' if position else 'wb') as file:
+                    file.seek(position)
+                    while chunk := response.read(1 << 20):
+                        file.write(chunk)
+                        position += len(chunk)
+                        stalls = 0
+                        if position >= next_report:
+                            print(f'{destination.name}: {position / 1e9:.2f} of '
+                                  f'{(total or 0) / 1e9:.2f} GB', flush=True)
+                            next_report = position + 1_000_000_000
+            if total is None or position == total:
+                partial.replace(destination)
+                return
+            error: Exception = ConnectionError(f'connection closed at {position} of {total} bytes')
+        except urllib.error.HTTPError as http_error:
+            if http_error.code == 416 and position:  # asked for bytes past the end: already complete
+                partial.replace(destination)
+                return
+            error = http_error
+        except (OSError, TimeoutError) as os_error:
+            if isinstance(os_error, PermissionError):
+                raise
+            error = os_error
+        stalls += 1
+        if stalls > max_stalls:
+            raise SystemExit(f'Download of {destination.name} made no progress after {max_stalls} '
+                             f'retries: {error}. Google Drive may be limiting this file; try again later.')
+        print(f'Retrying {destination.name} from {position} bytes ({error})', flush=True)
+        time.sleep(retry_wait)
+
+
 def fetch_clips(file_id: str, name: str, destination: Path) -> Path:
     """Download an archive unless already present and extract only the 1440p clips."""
     archive = TEMP / name
     if not archive.exists():
-        run(sys.executable, '-m', 'gdown', file_id, '-O', archive)
+        download(f'https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t', archive)
     destination.mkdir(parents=True, exist_ok=True)
     run('tar', 'xzf', archive, '-C', destination, '--wildcards', '*@1440.mp4', '--strip-components=1')
     archive.unlink()  # free disk before the much slower preparation step
