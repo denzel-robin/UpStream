@@ -89,3 +89,7 @@ See [the report-writing handoff](logs/progress-report-handoff.md) and [presentat
 ## Repository distribution
 
 See [repository contents and setup notes](docs/REPOSITORY_CONTENTS.md) for upstream model revisions, excluded local assets, dependency records, and fresh-clone requirements. Source attribution and compact measured results are included; pretrained checkpoints, environments and large raw outputs remain local.
+
+## New model: UpStreamVSR
+
+Project goals and milestones are in [docs/GOALS.md](docs/GOALS.md). The model design, current measurements, open risks and cloud training commands are in [docs/MODEL.md](docs/MODEL.md). The model is not yet trained on the full dataset.

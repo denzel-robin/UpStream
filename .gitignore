@@ -49,3 +49,7 @@ __pycache__/
 *.swp
 *.swo
 *~
+
+# Prepared training data and training runs
+/data/
+/runs/
