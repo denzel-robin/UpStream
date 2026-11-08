@@ -14,7 +14,8 @@ Additions in this project:
   frame at run time with no reload, and recurrent state stays valid across exits.
 * Resolution-switchable state: x2 and x4 inputs map onto one feature grid
   (output size / 4), so both modes cost about the same and state survives a
-  resolution switch.
+  resolution switch. Convolutions are shared between scales but BatchNorm is
+  per scale, because x2 and x4 features have different statistics.
 
 The model is strictly causal: each output depends only on current and past frames.
 """
@@ -31,24 +32,34 @@ SCALES = (2, 4)
 
 
 class RepBlock(nn.Module):
-    """3x3 + 1x1 + identity branches at training time; one plain 3x3 conv once fused."""
+    """3x3 + 1x1 + identity branches at training time; one plain 3x3 conv once fused.
 
-    def __init__(self, in_channels: int, out_channels: int):
+    Convolutions are shared across input scales, but each scale has its own
+    BatchNorm. x2 and x4 inputs have different feature statistics, so a single
+    set of running statistics fits neither: it follows whichever scale the last
+    training batches used. Once fused, each scale has its own plain 3x3 conv.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, scales: Sequence[int] = SCALES):
         super().__init__()
+        self.scales = tuple(scales)
+        keys = [f'x{scale}' for scale in self.scales]
         self.conv3 = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(out_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.bn_id = nn.BatchNorm2d(in_channels) if in_channels == out_channels else None
-        self.fused: nn.Conv2d | None = None
+        self.bn3 = nn.ModuleDict({key: nn.BatchNorm2d(out_channels) for key in keys})
+        self.bn1 = nn.ModuleDict({key: nn.BatchNorm2d(out_channels) for key in keys})
+        self.bn_id = (nn.ModuleDict({key: nn.BatchNorm2d(in_channels) for key in keys})
+                      if in_channels == out_channels else None)
+        self.fused: nn.ModuleDict | None = None
         self.activation = nn.LeakyReLU(0.1, inplace=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, scale: int) -> torch.Tensor:
+        key = f'x{scale}'
         if self.fused is not None:
-            return self.activation(self.fused(x))
-        out = self.bn3(self.conv3(x)) + self.bn1(self.conv1(x))
+            return self.activation(self.fused[key](x))
+        out = self.bn3[key](self.conv3(x)) + self.bn1[key](self.conv1(x))
         if self.bn_id is not None:
-            out = out + self.bn_id(x)
+            out = out + self.bn_id[key](x)
         return self.activation(out)
 
     @staticmethod
@@ -61,21 +72,45 @@ class RepBlock(nn.Module):
     def fuse(self) -> None:
         if self.fused is not None:
             return
-        kernel, bias = self._fuse_branch(self.conv3.weight, self.bn3)
-        kernel1, bias1 = self._fuse_branch(F.pad(self.conv1.weight, [1, 1, 1, 1]), self.bn1)
-        kernel, bias = kernel + kernel1, bias + bias1
-        if self.bn_id is not None:
-            identity = torch.zeros_like(self.conv3.weight)
-            for channel in range(identity.size(0)):
-                identity[channel, channel, 1, 1] = 1
-            kernel_id, bias_id = self._fuse_branch(identity, self.bn_id)
-            kernel, bias = kernel + kernel_id, bias + bias_id
-        fused = nn.Conv2d(self.conv3.in_channels, self.conv3.out_channels, 3, padding=1, bias=True)
-        fused.to(kernel.device, kernel.dtype)
-        fused.weight.copy_(kernel)
-        fused.bias.copy_(bias)
+        fused = nn.ModuleDict()
+        for key in self.bn3:
+            kernel, bias = self._fuse_branch(self.conv3.weight, self.bn3[key])
+            kernel1, bias1 = self._fuse_branch(F.pad(self.conv1.weight, [1, 1, 1, 1]), self.bn1[key])
+            kernel, bias = kernel + kernel1, bias + bias1
+            if self.bn_id is not None:
+                identity = torch.zeros_like(self.conv3.weight)
+                for channel in range(identity.size(0)):
+                    identity[channel, channel, 1, 1] = 1
+                kernel_id, bias_id = self._fuse_branch(identity, self.bn_id[key])
+                kernel, bias = kernel + kernel_id, bias + bias_id
+            conv = nn.Conv2d(self.conv3.in_channels, self.conv3.out_channels, 3, padding=1, bias=True)
+            conv.to(kernel.device, kernel.dtype)
+            conv.weight.copy_(kernel)
+            conv.bias.copy_(bias)
+            fused[key] = conv
         self.fused = fused
         del self.conv3, self.bn3, self.conv1, self.bn1, self.bn_id
+
+
+def upgrade_state_dict(model: nn.Module, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Load checkpoints from before per-scale BatchNorm by copying each shared BN to every scale.
+
+    Running statistics copied this way are a compromise between scales; recalibrate
+    them with scripts/calibrate_bn.py.
+    """
+    expected = model.state_dict()
+    upgraded = {}
+    for name, value in state.items():
+        if name in expected:
+            upgraded[name] = value
+            continue
+        prefix, _, field = name.rpartition('.')
+        copies = [f'{prefix}.{key}.{field}' for key in ('x2', 'x4') if f'{prefix}.{key}.{field}' in expected]
+        if not copies:
+            raise KeyError(f'unexpected parameter {name}')
+        for copy in copies:
+            upgraded[copy] = value.clone()
+    return upgraded
 
 
 @dataclass
@@ -114,8 +149,8 @@ class UpStreamVSR(nn.Module):
         self.num_feat = num_feat
         self.exits = exits
         self.entry = nn.ModuleDict({
-            'x2': RepBlock(3 * 4, num_feat),  # pixel-unshuffled onto the grid
-            'x4': RepBlock(3, num_feat),
+            'x2': RepBlock(3 * 4, num_feat, scales=(2,)),  # pixel-unshuffled onto the grid
+            'x4': RepBlock(3, num_feat, scales=(4,)),
         })
         self.gate = nn.Sequential(
             nn.Conv2d(2, 8, 3, padding=1),
@@ -161,11 +196,11 @@ class UpStreamVSR(nn.Module):
             (output, new_state), where output is (B, 3, H*scale, W*scale).
         """
         if scale == 4:
-            grid_x, feat = x, self.entry['x4'](x)
+            grid_x, feat = x, self.entry['x4'](x, 4)
             flow = F.interpolate(mv, scale_factor=4, mode='nearest')
         elif scale == 2:
             grid_x = F.avg_pool2d(x, 2)
-            feat = self.entry['x2'](F.pixel_unshuffle(x, 2))
+            feat = self.entry['x2'](F.pixel_unshuffle(x, 2), 2)
             flow = F.interpolate(mv, scale_factor=2, mode='nearest') * 0.5
         else:
             raise ValueError(f'scale must be one of {SCALES}, got {scale}')
@@ -187,12 +222,15 @@ class UpStreamVSR(nn.Module):
 
         depth = self.exits[exit_index]
         for block in self.blocks[:depth]:
-            out = block(out)
+            out = block(out, scale)
 
         adapted = out + self.exit_adapters[exit_index](out)
         residual = self.heads[f'x{scale}'](adapted)
         base = F.interpolate(x, scale_factor=scale, mode='bilinear', align_corners=False)
         return base + residual, StreamState(hidden=out, previous=grid_x)
+
+    def load_checkpoint_state(self, state: dict[str, torch.Tensor]) -> None:
+        self.load_state_dict(upgrade_state_dict(self, state))
 
     def fuse(self) -> 'UpStreamVSR':
         """Collapse all reparameterizable blocks for deployment."""

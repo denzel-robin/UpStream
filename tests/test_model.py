@@ -159,3 +159,50 @@ def test_endless_loader_starts_a_new_pass_each_epoch():
 
     stream = endless(Loader())
     assert [next(stream) for _ in range(3)] == [1, 2, 3]
+
+
+def old_layout(state):
+    """Collapse per-scale BatchNorm keys into the single-BN layout of earlier checkpoints."""
+    old = {}
+    for name, value in state.items():
+        parts = name.split('.')
+        if len(parts) >= 2 and parts[-2] in ('x2', 'x4') and parts[-3] in ('bn3', 'bn1', 'bn_id'):
+            old.setdefault('.'.join(parts[:-2] + parts[-1:]), value)
+        else:
+            old[name] = value
+    return old
+
+
+def test_old_checkpoint_loads_with_shared_statistics():
+    source = trained_like_model()
+    old = old_layout(source.state_dict())
+    assert not any(f'.{bn}.x2.' in name for name in old for bn in ('bn3', 'bn1', 'bn_id'))
+    model = UpStreamVSR(num_feat=8, exits=(1, 2))
+    model.load_checkpoint_state(old)
+    block = model.blocks[0]
+    assert torch.equal(block.bn3['x2'].running_mean, block.bn3['x4'].running_mean)
+    assert torch.equal(block.bn3['x2'].running_mean, source.blocks[0].bn3['x2'].running_mean)
+
+
+def test_scales_keep_separate_statistics():
+    model = trained_like_model()
+    block = model.blocks[0]
+    assert not torch.equal(block.bn3['x2'].running_mean, block.bn3['x4'].running_mean)
+
+
+def test_calibration_only_changes_the_calibrated_scale():
+    from calibrate_bn import calibrate
+
+    model = trained_like_model()
+    before_x4 = model.blocks[0].bn3['x4'].running_mean.clone()
+    before_x2 = model.blocks[0].bn3['x2'].running_mean.clone()
+    x, mv, intra = inputs(2, seed=3)
+    frames = 3
+    batch = {'lr2': x.unsqueeze(1).repeat(1, frames, 1, 1, 1) * 5,
+             'mv2': mv.unsqueeze(1).repeat(1, frames, 1, 1, 1),
+             'intra2': intra.unsqueeze(1).repeat(1, frames),
+             'gt': torch.zeros(2, frames, 3, 128, 192)}
+    calibrate(model, [batch], 2, batches=2, device=torch.device('cpu'))
+    assert torch.equal(model.blocks[0].bn3['x4'].running_mean, before_x4)
+    assert not torch.equal(model.blocks[0].bn3['x2'].running_mean, before_x2)
+    assert model.blocks[0].bn3['x2'].momentum == 0.1 and not model.training

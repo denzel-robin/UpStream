@@ -71,7 +71,7 @@ def main() -> None:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
     model = UpStreamVSR(**checkpoint['config']).to(device)
-    model.load_state_dict(checkpoint['model'])
+    model.load_checkpoint_state(checkpoint['model'])
     model.eval()
 
     report = {'iteration': checkpoint['iteration']}

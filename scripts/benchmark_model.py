@@ -78,7 +78,7 @@ def main() -> None:
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
         model = UpStreamVSR(**checkpoint['config'])
-        model.load_state_dict(checkpoint['model'])
+        model.load_checkpoint_state(checkpoint['model'])
     model = model.to(device).eval().fuse()
 
     report = {

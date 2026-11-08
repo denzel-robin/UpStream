@@ -5,6 +5,8 @@ prepare: download StreamSR, build windows, write one tar to the notebook output.
          A tar is used because Kaggle limits how many output files a notebook keeps.
 train:   unpack the attached windows, resume from any attached checkpoint, train
          until the time budget, then score the result.
+calibrate: recompute per-scale BatchNorm statistics for attached checkpoints
+         and score each one before and after.
 
 Session limits are deliberately conservative: an output is only kept if the
 notebook finishes on time, so the budget stays well below Kaggle's limit.
@@ -224,6 +226,25 @@ def train(args: argparse.Namespace) -> None:
         run(sys.executable, REPO / 'scripts/evaluate_upstream.py', data, best, '--report', run_dir / 'evaluation.json')
 
 
+def calibrate(args: argparse.Namespace) -> None:
+    check_gpu()
+    data = find_data()
+    out = WORKING / 'calibrated'
+    out.mkdir(parents=True, exist_ok=True)
+    checkpoints = sorted(INPUT.rglob('best.pt')) + sorted(INPUT.rglob('latest.pt'))
+    if not checkpoints:
+        raise SystemExit(f'No best.pt or latest.pt under {INPUT}. Attach the output of the training notebook.')
+    for checkpoint in checkpoints:
+        name = checkpoint.stem
+        run(sys.executable, REPO / 'scripts/evaluate_upstream.py', data, checkpoint,
+            '--report', out / f'{name}-before.json')
+        calibrated = out / f'{name}-calibrated.pt'
+        run(sys.executable, REPO / 'scripts/calibrate_bn.py', data, checkpoint, calibrated,
+            '--batches', args.batches)
+        run(sys.executable, REPO / 'scripts/evaluate_upstream.py', data, calibrated,
+            '--report', out / f'{name}-after.json')
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -236,8 +257,10 @@ def main() -> None:
     fit.add_argument('--batch-size', type=int, default=8)
     fit.add_argument('--frames', type=int, default=12)
     fit.add_argument('--val-every', type=int)
+    cal = commands.add_parser('calibrate')
+    cal.add_argument('--batches', type=int, default=100, help='batches of training windows per scale')
     args = parser.parse_args()
-    {'prepare': prepare, 'train': train}[args.command](args)
+    {'prepare': prepare, 'train': train, 'calibrate': calibrate}[args.command](args)
 
 
 if __name__ == '__main__':

@@ -132,12 +132,16 @@ def main() -> None:
     latest = args.output / 'latest.pt'
     if latest.exists():
         checkpoint = torch.load(latest, map_location=device, weights_only=True)
-        model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        scheduler.load_state_dict(checkpoint['scheduler'])
-        scaler.load_state_dict(checkpoint['scaler'])
-        iteration, best = checkpoint['iteration'], checkpoint['best']
-        print(f'resumed from iteration {iteration}', flush=True)
+        if set(checkpoint['model']) == set(model.state_dict()):
+            model.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            scheduler.load_state_dict(checkpoint['scheduler'])
+            scaler.load_state_dict(checkpoint['scaler'])
+            iteration, best = checkpoint['iteration'], checkpoint['best']
+            print(f'resumed from iteration {iteration}', flush=True)
+        else:  # older layout: keep the weights, restart the optimizer and schedule
+            model.load_checkpoint_state(checkpoint['model'])
+            print('initialised from an older checkpoint; optimizer and schedule restart', flush=True)
 
     def save(path: Path) -> None:
         temporary = path.with_suffix('.tmp')

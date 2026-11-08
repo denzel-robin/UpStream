@@ -96,22 +96,51 @@ the model can beat bicubic on video it has not seen.
 | 9 blocks | 25.20 | 21.94 |
 | 9 blocks, state reset every frame | 25.18 | 22.00 |
 
+First full Kaggle run (2026-11-08): 1,940 training windows from about 1,230 clips,
+100,000 iterations at batch 8 on a T4, about 4.1 it/s. `best.pt` is from iteration
+68,000, chosen on val. Val and test clips are never trained on; test is the 18-clip
+StreamSR subjective set. Model PSNR is RGB against the 720p ground truth.
+
+| Method | val x2 | val x4 | test x2 | test x4 |
+|---|---:|---:|---:|---:|
+| Bilinear | 30.14 | 26.75 | 30.25 | 26.99 |
+| Bicubic | 30.61 | 27.13 | 30.63 | 27.34 |
+| 3 blocks | 31.20 | 27.73 | 31.59 | 28.19 |
+| 6 blocks | 31.21 | 27.78 | 31.65 | 28.26 |
+| 9 blocks | 31.27 | 27.84 | 31.78 | 28.37 |
+| 9 blocks, state reset every frame | 31.27 | 27.83 | 31.77 | 28.36 |
+
+Findings:
+
+- On test it beats bicubic by 1.15 dB at x2 and 1.02 dB at x4.
+- Depth helps a little: 9 blocks is 0.11 to 0.19 dB above 3 blocks. 3 blocks keeps
+  about 85% of the gain at about 60% of the time.
+- Recurrent state adds nothing (at most 0.01 dB). The learned gate passes only 2 to 6%
+  of the warped state even when the warp is perfect, so the model has learned to ignore it.
+- Validation scores swing by up to 2.9 dB between checks, and x2 and x4 move in
+  opposite directions (correlation -0.83 over 50 checks). Cause: all blocks shared one
+  set of BatchNorm statistics, which track whichever scale the last batches used, since
+  they update once per frame. The checkpoint picked as best is partly luck. Fixed by giving
+  each scale its own BatchNorm (convolutions stay shared) and by
+  `scripts/calibrate_bn.py`, which recomputes per-scale statistics for existing checkpoints.
+
 ## Open risks
 
-1. **Recurrent state is not yet shown to help.** In the table above it makes no clear
-   difference, and in the overfitting test it scored about 0.9 dB below no state. The
-   temporal path has to beat no-state on held-out video after full training, or the
-   design needs to change. This is the first thing to check.
-2. **Extra depth is not yet shown to help.** All three exits score about the same.
-   Anytime depth is only useful if deeper exits become measurably better with full training.
+1. **Recurrent state does not help.** After full training the gate is almost closed.
+   Possible causes: raw deep features are added straight onto entry features, motion
+   vectors cover 16-pixel cells, and the shared BatchNorm problem above. The design of the
+   temporal path needs to change, or the report has to say it gives no benefit.
+2. **Depth gives a small range** (0.1 to 0.2 dB). That is enough for the controller to
+   trade speed for quality, but only just.
 3. **Direct delivery may still win.** The earlier study found it beat NanoVSR at matched
    rates at 360p playback. The real test is rate-quality against direct delivery at 720p.
-4. **BatchNorm:** eval-mode scores sat about 1 dB below train-mode in the overfitting test.
-   Recheck at full batch sizes.
+4. **Per-scale BatchNorm is untested on real data.** Recalibration should reach the
+   upper values seen during training (val x2 about 31.8, x4 about 28.3) for both scales at
+   once; `kaggle/3_calibrate.ipynb` checks this.
 
 ## Training on Kaggle
 
-The two notebooks in `kaggle/` call `scripts/kaggle_run.py`. Upload them to Kaggle and
+The notebooks in `kaggle/` call `scripts/kaggle_run.py`. Upload them to Kaggle and
 run each with **Save Version > Save & Run All**, because an interactive session loses its
 output when it stops. Internet must be on, which requires a phone-verified Kaggle account.
 
@@ -122,9 +151,12 @@ output when it stops. Internet must be on, which requires a phone-verified Kaggl
 2. **`kaggle/2_train.ipynb`**, Accelerator **GPU T4 x2**, with notebook 1's output attached
    under **Add Input**. It trains for up to 8 hours, then writes `run/` with checkpoints
    and `evaluation.json`. To continue, also attach its previous output and run it again.
+3. **`kaggle/3_calibrate.ipynb`**, Accelerator **GPU T4 x2**, with the outputs of notebooks
+   1 and 2 attached. Recomputes per-scale BatchNorm statistics and scores each checkpoint
+   before and after.
 
 Tested locally with stand-in archives and a fake Kaggle directory, including resuming and
-stopping at the time limit. Not yet tested on Kaggle itself or with the real download. The
+stopping at the time limit. Notebooks 1 and 2 have run successfully on Kaggle. The
 paper describes the videos as CC BY 4.0; do not commit them here.
 
 To train elsewhere, use `scripts/prepare_streamsr.py` and `scripts/train_upstream.py`
