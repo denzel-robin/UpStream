@@ -124,19 +124,45 @@ Findings:
   each scale its own BatchNorm (convolutions stay shared) and by
   `scripts/calibrate_bn.py`, which recomputes per-scale statistics for existing checkpoints.
 
+Per-scale BatchNorm recalibration (`kaggle/3_calibrate.ipynb`, 800 training windows
+per scale, weights unchanged). `latest.pt` (iteration 100,000) after recalibration is
+now the best checkpoint on val, so it is the one to use.
+
+| Method | val x2 | val x4 | test x2 | test x4 |
+|---|---:|---:|---:|---:|
+| Bicubic | 30.61 | 27.13 | 30.63 | 27.34 |
+| best.pt before | 31.27 | 27.84 | 31.78 | 28.37 |
+| latest.pt before | 31.50 | 27.28 | 32.06 | 27.56 |
+| latest.pt after, 3 blocks | 31.80 | 28.19 | 32.31 | 28.72 |
+| latest.pt after, 6 blocks | 31.77 | 28.21 | 32.28 | 28.75 |
+| latest.pt after, 9 blocks | **31.88** | **28.29** | **32.38** | **28.84** |
+| latest.pt after, 9 blocks, state reset | 31.87 | 28.28 | 32.38 | 28.83 |
+
+- Recalibration added 0.6 dB (x2) and 0.5 dB (x4) on test over the earlier best, with
+  no retraining. On test the model now beats bicubic by 1.75 dB at x2 and 1.50 dB at x4.
+- The shared statistics had left `latest.pt` tuned for x2: before recalibration it was
+  only 0.2 dB above bicubic at x4.
+- Depth range is now smaller: 3 blocks reaches about 95% of the 9-block gain, and
+  6 blocks is no better than 3. The anytime exits currently buy speed, not quality.
+- Recurrent state still adds at most 0.01 dB.
+
+Speed of the trained, fused model on the RTX 3050 Laptop: same as the table above
+(3.5 / 4.8 / 6.0 ms at 180p, 3.7 / 4.9 / 6.2 ms at 360p). Deployed with one fused trunk
+per scale, 202k parameters in total, of which each frame uses half.
+
 ## Open risks
 
 1. **Recurrent state does not help.** After full training the gate is almost closed.
    Possible causes: raw deep features are added straight onto entry features, motion
    vectors cover 16-pixel cells, and the shared BatchNorm problem above. The design of the
    temporal path needs to change, or the report has to say it gives no benefit.
-2. **Depth gives a small range** (0.1 to 0.2 dB). That is enough for the controller to
-   trade speed for quality, but only just.
+2. **Depth gives a small range** (about 0.1 dB after recalibration). Three blocks is
+   nearly as good as nine, so the controller can always afford good quality, but the
+   anytime claim is weak unless deeper exits gain more after the next training run.
 3. **Direct delivery may still win.** The earlier study found it beat NanoVSR at matched
    rates at 360p playback. The real test is rate-quality against direct delivery at 720p.
-4. **Per-scale BatchNorm is untested on real data.** Recalibration should reach the
-   upper values seen during training (val x2 about 31.8, x4 about 28.3) for both scales at
-   once; `kaggle/3_calibrate.ipynb` checks this.
+4. **Per-scale BatchNorm during training is untested.** Recalibration confirmed the
+   cause; the next training run will be the first with per-scale BatchNorm from the start.
 
 ## Training on Kaggle
 
