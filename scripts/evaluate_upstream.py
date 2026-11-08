@@ -36,7 +36,7 @@ def run_model(model, lr, mv, intra, scale, exit_index, use_state) -> torch.Tenso
     return torch.cat(outputs)
 
 
-def evaluate_split(model, root: Path, frames: int, device) -> dict:
+def evaluate_split(model, root: Path, frames: int, device, use_state: bool = True) -> dict:
     dataset = WindowDataset(root, frames, train=False)
     report = {'windows': len(dataset)}
     for scale in (2, 4):
@@ -53,8 +53,9 @@ def evaluate_split(model, root: Path, frames: int, device) -> dict:
             for mode in ('bilinear', 'bicubic'):
                 add(mode, psnr(F.interpolate(lr, scale_factor=scale, mode=mode, align_corners=False), gt))
             for index, depth in enumerate(model.exits):
-                add(f'blocks{depth}', psnr(run_model(model, lr, mv, intra, scale, index, True), gt))
-            add('no_state', psnr(run_model(model, lr, mv, intra, scale, -1, False), gt))
+                add(f'blocks{depth}', psnr(run_model(model, lr, mv, intra, scale, index, use_state), gt))
+            if use_state:
+                add('no_state', psnr(run_model(model, lr, mv, intra, scale, -1, False), gt))
         report[f'x{scale}'] = {name: round(value / len(dataset), 3) for name, value in totals.items()}
     return report
 
@@ -74,10 +75,11 @@ def main() -> None:
     model.load_checkpoint_state(checkpoint['model'])
     model.eval()
 
-    report = {'iteration': checkpoint['iteration']}
+    use_state = not checkpoint.get('no_state', False)
+    report = {'iteration': checkpoint['iteration'], 'trained_with_state': use_state}
     for split in args.splits:
         if any((args.data / split).glob('*.npz')):
-            report[split] = evaluate_split(model, args.data / split, args.frames, device)
+            report[split] = evaluate_split(model, args.data / split, args.frames, device, use_state)
         else:
             print(f'skipping {split}: no windows', flush=True)
     text = json.dumps(report, indent=2)

@@ -206,3 +206,26 @@ def test_calibration_only_changes_the_calibrated_scale():
     assert torch.equal(model.blocks[0].bn3['x4'].running_mean, before_x4)
     assert not torch.equal(model.blocks[0].bn3['x2'].running_mean, before_x2)
     assert model.blocks[0].bn3['x2'].momentum == 0.1 and not model.training
+
+
+@pytest.mark.parametrize('exit_index', [0, 1])
+def test_all_exits_match_single_exit_outputs(exit_index):
+    model = trained_like_model()
+    x, mv, intra = inputs(4)
+    with torch.no_grad():
+        _, state = model.step(x, mv, intra, None, 4)
+        outputs, all_state = model.step(x, mv, intra, state, 4, exit_index, all_exits=True)
+        single, single_state = model.step(x, mv, intra, state, 4, exit_index)
+    assert len(outputs) == len(model.exits)
+    assert torch.allclose(outputs[exit_index], single)
+    assert torch.allclose(all_state.hidden, single_state.hidden)
+
+
+def test_previous_output_survives_resolution_switch():
+    model = trained_like_model()
+    with torch.no_grad():
+        x4, mv4, intra = inputs(4)
+        out4, state = model.step(x4, mv4, intra, None, 4)
+        x2, mv2, _ = inputs(2)
+        out2, switched = model.step(x2, mv2, intra, state, 2)
+    assert state.output.shape == switched.output.shape == out2.shape == out4.shape

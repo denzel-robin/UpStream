@@ -115,10 +115,15 @@ def upgrade_state_dict(model: nn.Module, state: dict[str, torch.Tensor]) -> dict
 
 @dataclass
 class StreamState:
-    """Recurrent state on the shared feature grid; independent of the input scale."""
+    """Recurrent state. Independent of the input scale, so it survives a switch.
+
+    hidden and previous live on the shared feature grid; output is the last
+    reconstructed frame at output resolution.
+    """
 
     hidden: torch.Tensor
     previous: torch.Tensor
+    output: torch.Tensor
 
 
 def warp(x: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
@@ -158,6 +163,12 @@ class UpStreamVSR(nn.Module):
             nn.Conv2d(8, 1, 3, padding=1),
             nn.Sigmoid(),
         )
+        # Start with the gate mostly open, so the model has to learn when to distrust
+        # the past instead of starting from a closed gate that gets no useful gradient.
+        nn.init.constant_(self.gate[2].bias, 2.0)
+        # Current features, warped hidden state and the warped previous output
+        # (space-to-depth onto the grid) are mixed by one cheap 1x1 conv.
+        self.fusion = nn.Conv2d(2 * num_feat + 48, num_feat, 1)
         self.blocks = nn.ModuleList(RepBlock(num_feat, num_feat) for _ in range(exits[-1]))
         self.exit_adapters = nn.ModuleList(nn.Conv2d(num_feat, num_feat, 1) for _ in exits)
         for adapter in self.exit_adapters:
@@ -180,7 +191,8 @@ class UpStreamVSR(nn.Module):
         state: StreamState | None,
         scale: int,
         exit_index: int = -1,
-    ) -> tuple[torch.Tensor, StreamState]:
+        all_exits: bool = False,
+    ) -> tuple[torch.Tensor | list[torch.Tensor], StreamState]:
         """Reconstruct one frame.
 
         Args:
@@ -190,10 +202,12 @@ class UpStreamVSR(nn.Module):
             is_intra: (B,) bool or float, 1 for I-frames.
             state: state from the previous frame, or None at stream start.
             scale: 2 or 4. May change between frames while keeping the state.
-            exit_index: which anytime exit to use.
+            exit_index: which anytime exit to use; its features and output become the state.
+            all_exits: also return every other exit's output (for training).
 
         Returns:
-            (output, new_state), where output is (B, 3, H*scale, W*scale).
+            (output, new_state), where output is (B, 3, H*scale, W*scale), or a list
+            with one output per exit when all_exits is set.
         """
         if scale == 4:
             grid_x, feat = x, self.entry['x4'](x, 4)
@@ -207,27 +221,40 @@ class UpStreamVSR(nn.Module):
 
         b, _, h, w = feat.shape
         intra = is_intra.to(x.dtype).view(b, 1, 1, 1).expand(b, 1, h, w)
+        base = F.interpolate(x, scale_factor=scale, mode='bilinear', align_corners=False)
         if state is None:
             warped_hidden = feat.new_zeros(feat.shape)
             warped_previous = grid_x
+            warped_output = base
         else:
             warped_hidden = warp(state.hidden, flow)
             warped_previous = warp(state.previous, flow)
+            output_flow = F.interpolate(mv, size=base.shape[-2:], mode='nearest') * scale
+            warped_output = warp(state.output, output_flow)
 
         # The motion-compensation error stands in for the codec residual: it is
         # available without a patched decoder and also flags occlusions and bad MVs.
         error = (grid_x - warped_previous).abs().mean(dim=1, keepdim=True)
         gate = self.gate(torch.cat((error, intra), dim=1))
-        out = feat + gate * warped_hidden
+        past = torch.cat((warped_hidden, F.pixel_unshuffle(warped_output, 4)), dim=1)
+        out = feat + self.fusion(torch.cat((feat, gate * past), dim=1))
 
-        depth = self.exits[exit_index]
-        for block in self.blocks[:depth]:
+        exit_index %= len(self.exits)
+        wanted = range(len(self.exits)) if all_exits else (exit_index,)
+        outputs, hidden = {}, None
+        for depth, block in enumerate(self.blocks[:self.exits[max(wanted)]], start=1):
             out = block(out, scale)
-
-        adapted = out + self.exit_adapters[exit_index](out)
-        residual = self.heads[f'x{scale}'](adapted)
-        base = F.interpolate(x, scale_factor=scale, mode='bilinear', align_corners=False)
-        return base + residual, StreamState(hidden=out, previous=grid_x)
+            if depth in self.exits:
+                index = self.exits.index(depth)
+                if index in wanted:
+                    adapted = out + self.exit_adapters[index](out)
+                    outputs[index] = base + self.heads[f'x{scale}'](adapted)
+                if index == exit_index:
+                    hidden = out
+        new_state = StreamState(hidden=hidden, previous=grid_x, output=outputs[exit_index])
+        if all_exits:
+            return [outputs[index] for index in wanted], new_state
+        return outputs[exit_index], new_state
 
     def load_checkpoint_state(self, state: dict[str, torch.Tensor]) -> None:
         self.load_state_dict(upgrade_state_dict(self, state))

@@ -54,8 +54,20 @@ def scale_inputs(batch: dict, scale: int, t: int) -> tuple[torch.Tensor, torch.T
     return batch[f'lr{key}'][:, t], batch[f'mv{key}'][:, t], batch[f'intra{key}'][:, t]
 
 
+def frame_loss(output: torch.Tensor, target: torch.Tensor, edge_weight: float) -> torch.Tensor:
+    loss = charbonnier(output, target)
+    if edge_weight:
+        loss = loss + edge_weight * charbonnier(sobel_edges(output), sobel_edges(target))
+    return loss
+
+
 def train_sequence(model, batch, args) -> torch.Tensor:
-    """Run a window with random exits and, sometimes, one resolution switch."""
+    """Run a window with, sometimes, one resolution switch.
+
+    Every exit is scored on every frame, so the deepest exit gets as much training
+    as the shallowest. The state passed on comes from a randomly chosen exit, so it
+    stays usable whichever exit the live pipeline picks.
+    """
     frames = batch['gt'].size(1)
     scale = random.choice((2, 4))
     switch_at = random.randrange(1, frames) if random.random() < args.switch_probability else None
@@ -64,16 +76,15 @@ def train_sequence(model, batch, args) -> torch.Tensor:
         if t == switch_at:
             scale = 6 - scale
         x, mv, intra = scale_inputs(batch, scale, t)
-        output, state = model.step(x, mv, intra, state, scale, choose_exit(len(model.exits)))
+        outputs, state = model.step(x, mv, intra, None if args.no_state else state, scale,
+                                    choose_exit(len(model.exits)), all_exits=True)
         target = batch['gt'][:, t]
-        loss = loss + charbonnier(output, target)
-        if args.edge_weight:
-            loss = loss + args.edge_weight * charbonnier(sobel_edges(output), sobel_edges(target))
+        loss = loss + sum(frame_loss(output, target, args.edge_weight) for output in outputs) / len(outputs)
     return loss / frames
 
 
 @torch.no_grad()
-def validate(model, loader, device, exits_to_check) -> dict[str, float]:
+def validate(model, loader, device, exits_to_check, use_state=True) -> dict[str, float]:
     """Mean RGB PSNR per exit and scale on the same windows, so results are comparable."""
     model.eval()
     results = {}
@@ -85,7 +96,7 @@ def validate(model, loader, device, exits_to_check) -> dict[str, float]:
                 state = None
                 for t in range(batch['gt'].size(1)):
                     x, mv, intra = scale_inputs(batch, scale, t)
-                    output, state = model.step(x, mv, intra, state, scale, exit_index)
+                    output, state = model.step(x, mv, intra, state if use_state else None, scale, exit_index)
                     mse = (output.clamp(0, 1) - batch['gt'][:, t]).pow(2).mean(dim=(1, 2, 3))
                     errors.append(mse.clamp_min(1e-10))
             psnr = (-10 * torch.log10(torch.cat(errors))).mean().item()
@@ -110,6 +121,7 @@ def main() -> None:
     parser.add_argument('--val-every', type=int, default=2000)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--max-hours', type=float, help='save and exit cleanly after this long')
+    parser.add_argument('--no-state', action='store_true', help='ablation: reset the state on every frame')
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -148,7 +160,8 @@ def main() -> None:
         torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(), 'scaler': scaler.state_dict(),
                     'iteration': iteration, 'best': best,
-                    'config': {'num_feat': args.num_feat, 'exits': args.exits}}, temporary)
+                    'config': {'num_feat': args.num_feat, 'exits': args.exits},
+                    'no_state': args.no_state}, temporary)
         temporary.replace(path)
 
     log = (args.output / 'log.jsonl').open('a')
@@ -179,7 +192,7 @@ def main() -> None:
             started = time.monotonic()
             print(f'iter {iteration} loss {loss.item():.5f} {rate:.2f} it/s', flush=True)
         if iteration % args.val_every == 0 or iteration == args.iterations:
-            metrics = validate(model, val_loader, device, exits_to_check)
+            metrics = validate(model, val_loader, device, exits_to_check, not args.no_state)
             score = sum(metrics.values()) / len(metrics)
             log.write(json.dumps({'iteration': iteration, 'loss': loss.item(), **metrics}) + '\n')
             log.flush()

@@ -220,10 +220,17 @@ def train(args: argparse.Namespace) -> None:
                '--batch-size', args.batch_size, '--frames', args.frames]
     if args.val_every:
         command += ['--val-every', args.val_every]
+    if args.no_state:
+        command += ['--no-state']
     run(*command)
-    best = run_dir / 'best.pt'
-    if best.exists():
-        run(sys.executable, REPO / 'scripts/evaluate_upstream.py', data, best, '--report', run_dir / 'evaluation.json')
+    # Training statistics follow the last few batches; recompute them before scoring.
+    for name in ('latest', 'best'):
+        checkpoint = run_dir / f'{name}.pt'
+        if checkpoint.exists():
+            calibrated = run_dir / f'{name}-calibrated.pt'
+            run(sys.executable, REPO / 'scripts/calibrate_bn.py', data, checkpoint, calibrated)
+            run(sys.executable, REPO / 'scripts/evaluate_upstream.py', data, calibrated,
+                '--report', run_dir / f'{name}-evaluation.json')
 
 
 def calibrate(args: argparse.Namespace) -> None:
@@ -257,6 +264,7 @@ def main() -> None:
     fit.add_argument('--batch-size', type=int, default=8)
     fit.add_argument('--frames', type=int, default=12)
     fit.add_argument('--val-every', type=int)
+    fit.add_argument('--no-state', action='store_true', help='ablation: train without recurrent state')
     cal = commands.add_parser('calibrate')
     cal.add_argument('--batches', type=int, default=100, help='batches of training windows per scale')
     args = parser.parse_args()

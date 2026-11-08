@@ -36,7 +36,8 @@ def scale_norms(model: UpStreamVSR, scale: int) -> list[torch.nn.BatchNorm2d]:
 
 
 @torch.no_grad()
-def calibrate(model: UpStreamVSR, loader: DataLoader, scale: int, batches: int, device) -> None:
+def calibrate(model: UpStreamVSR, loader: DataLoader, scale: int, batches: int, device,
+              use_state: bool = True) -> None:
     norms = scale_norms(model, scale)
     model.eval()
     for norm in norms:
@@ -50,7 +51,9 @@ def calibrate(model: UpStreamVSR, loader: DataLoader, scale: int, batches: int, 
             state = None
             for t in range(batch['gt'].size(1)):
                 x, mv, intra = scale_inputs(batch, scale, t)
-                _, state = model.step(x, mv, intra, state, scale, choose_exit(len(model.exits)))
+                # Same pattern as training: every exit runs, state from a random exit.
+                _, state = model.step(x, mv, intra, state if use_state else None, scale,
+                                      choose_exit(len(model.exits)), all_exits=True)
             seen += 1
             if seen >= batches:
                 break
@@ -81,12 +84,13 @@ def main() -> None:
     dataset = WindowDataset(args.data / 'train', args.frames, train=True)
     loader = DataLoader(dataset, args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
     for scale in (2, 4):
-        calibrate(model, loader, scale, args.batches, device)
+        calibrate(model, loader, scale, args.batches, device, not checkpoint.get('no_state', False))
         print(f'calibrated x{scale} on {args.batches * args.batch_size} windows', flush=True)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save({'model': model.state_dict(), 'iteration': checkpoint['iteration'],
-                'config': checkpoint['config'], 'calibrated_from': str(args.checkpoint),
+                'config': checkpoint['config'], 'no_state': checkpoint.get('no_state', False),
+                'calibrated_from': str(args.checkpoint),
                 'calibration_windows': args.batches * args.batch_size}, args.output)
     print('wrote', args.output)
 

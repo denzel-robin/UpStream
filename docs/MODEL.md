@@ -150,6 +150,24 @@ Speed of the trained, fused model on the RTX 3050 Laptop: same as the table abov
 (3.5 / 4.8 / 6.0 ms at 180p, 3.7 / 4.9 / 6.2 ms at 360p). Deployed with one fused trunk
 per scale, 202k parameters in total, of which each frame uses half.
 
+## Second design (2026-11-08)
+
+Changes after the first run, where the gate closed and depth gave little:
+
+- **Temporal fusion:** current features, the warped hidden state and the warped previous
+  output frame (720p, moved by the motion vectors scaled to output pixels, then
+  space-to-depth onto the grid) are mixed by one 1x1 conv, instead of adding raw hidden
+  features. The previous output is at output resolution, so it survives a scale switch.
+- **Gate starts open** (sigmoid bias +2, about 0.88), so it has to learn when to close.
+- **All exits scored on every frame**, instead of one random exit per frame. The state
+  passed on still comes from a random exit, so it works whichever exit runs live.
+- **Per-scale BatchNorm from the start**, plus recalibration at the end of training.
+- **Ablation run** (`kaggle/2b_train_no_state.ipynb`): the same recipe with the state reset
+  on every frame.
+
+Cost: training is about 0.56x as fast (laptop measurement), so the run is 70,000 iterations.
+Inference adds one warp at output resolution and a 1x1 conv; benchmark again after training.
+
 ## Open risks
 
 1. **Recurrent state does not help.** After full training the gate is almost closed.
