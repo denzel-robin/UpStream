@@ -41,7 +41,7 @@ Complete a live video upscaling pipeline that balances four things:
 | 3 | Live integration: motion vectors from the decoder, per-frame depth, separate reconstruction and display threads | Not started |
 | 4 | Trade-off controller with mid-stream resolution and bitrate switching | Not started |
 | 5 | Evaluation with shaped network conditions, ablation of each technique, sustained run | Not started |
-| 6 | Report (must explain how the four-way trade-off works, with measured results) and final demo | Not started |
+| 6 | Report (must explain how the four-way trade-off works and how and why the pipeline switches between direct, x2 and x4, with measured results) and final demo | Not started |
 
 ## Success criteria
 
