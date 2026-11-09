@@ -168,6 +168,31 @@ Changes after the first run, where the gate closed and depth gave little:
 Cost: training is about 0.56x as fast (laptop measurement), so the run is 70,000 iterations.
 Inference adds one warp at output resolution and a 1x1 conv; benchmark again after training.
 
+Second-design results (`upstream-4-train`, 70,000 iterations, 7.4 h on a T4 at 2.76 it/s,
+then per-scale recalibration; `latest`). First design shown for comparison (recalibrated
+`latest` from the first run, 100,000 iterations).
+
+| Test PSNR | x2 3 blocks | x2 9 blocks | x4 3 blocks | x4 9 blocks | x4 9 blocks, state reset |
+|---|---:|---:|---:|---:|---:|
+| Bicubic | 30.63 | 30.63 | 27.34 | 27.34 | 27.34 |
+| First design | 32.31 | 32.38 | 28.72 | 28.84 | 28.83 |
+| Second design | 32.23 | 32.36 | 28.67 | 28.85 | 28.70 |
+
+| Val PSNR | x2 3 blocks | x2 9 blocks | x4 3 blocks | x4 9 blocks |
+|---|---:|---:|---:|---:|
+| First design | 31.80 | 31.88 | 28.19 | 28.29 |
+| Second design | 31.70 | 31.85 | 28.15 | 28.31 |
+
+- Peak quality is unchanged (within 0.03 dB).
+- The temporal path now does something: resetting state costs 0.15 dB at x4 (was 0.01).
+  At x2 it is still only 0.01 dB. These are the same weights with state reset, not a
+  separately trained model; the proper ablation is postponed.
+- Depth range grew a little: 9 blocks over 3 is 0.13 dB at x2 and 0.18 dB at x4 on test.
+- Training is now stable: x2 and x4 validation move together (correlation +0.93, was -0.83).
+- Cost on the RTX 3050 Laptop, fused, synthetic input with zero motion: 5.4 / 6.6 / 7.9 ms
+  at 180p and 5.5 / 6.8 / 8.0 ms at 360p for 3 / 6 / 9 blocks, about 1.9 ms more than the
+  first design (the extra warp at output resolution). Peak 123 to 127 MiB.
+
 ## Open risks
 
 1. **Recurrent state does not help.** After full training the gate is almost closed.
