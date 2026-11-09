@@ -53,10 +53,14 @@ def encode(source: Path, workdir: Path, crf: int, fps: float, seconds: float) ->
     # 45+ fps sources are halved so that frame spacing resembles the 30 fps live stream.
     step = 'framestep=2,' if fps >= 45 else ''
     scale = ':flags=area+accurate_rnd:out_color_matrix=bt709:out_range=tv'
+    # The second scale must be told its input is BT.709. Older ffmpeg (as on Kaggle)
+    # does not carry the first scale's output matrix forward and assumes BT.601,
+    # which shifts the colours of the low-resolution inputs but not the ground truth.
+    rescale = scale + ':in_color_matrix=bt709:in_range=tv'
     paths = {name: workdir / f'{name}.{ext}' for name, ext in
              (('gt', 'nut'), ('lr2', 'mp4'), ('lr4', 'mp4'))}
     graph = (f'[0:v]{step}scale=1280:720{scale},format=yuv444p,split=3[gt][a][b];'
-             f'[a]scale=640:360{scale}[lr2];[b]scale=320:180{scale}[lr4]')
+             f'[a]scale=640:360{rescale}[lr2];[b]scale=320:180{rescale}[lr4]')
     command = ['ffmpeg', '-v', 'error', '-y', '-t', str(seconds), '-i', str(source),
                '-filter_complex', graph,
                '-map', '[gt]', '-c:v', 'ffv1', '-colorspace', 'bt709', '-color_range', 'tv', str(paths['gt']),
@@ -64,6 +68,30 @@ def encode(source: Path, workdir: Path, crf: int, fps: float, seconds: float) ->
                '-map', '[lr4]', *X264, '-crf', str(crf), str(paths['lr4'])]
     subprocess.run(command, check=True)
     return paths
+
+
+def check_colour(tolerance: float = 2.0) -> None:
+    """Fail fast if this ffmpeg makes the inputs' colours differ from the ground truth.
+
+    A saturated solid colour goes through the real filter graph. Any colour-matrix
+    or range mismatch between the renditions moves it by several levels.
+    """
+    with tempfile.TemporaryDirectory() as temp:
+        source = Path(temp) / 'colour.mp4'
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=0xC03020:s=1920x1080:r=30',
+                        '-t', '1', '-c:v', 'libx264', '-qp', '0', '-pix_fmt', 'yuv444p',
+                        '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709',
+                        '-color_range', 'tv', str(source)], check=True)
+        paths = encode(source, Path(temp), 18, 30, 1)
+        means = {name: np.mean([frame.rgb.reshape(-1, 3).mean(0) for frame in decode_with_motion(path)], axis=0)
+                 for name, path in paths.items()}
+    for name in ('lr2', 'lr4'):
+        error = np.abs(means[name] - means['gt']).max()
+        if error > tolerance:
+            raise SystemExit(f'{name} colours differ from the ground truth by {error:.1f} levels '
+                             f'(gt {means["gt"].round(1)}, {name} {means[name].round(1)}); '
+                             'this ffmpeg build would produce mismatched training data')
+    print('colour check passed', {name: value.round(1).tolist() for name, value in means.items()}, flush=True)
 
 
 def choose_windows(total: int, length: int, count: int, rng: random.Random) -> list[int]:
@@ -181,6 +209,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.patch % 16:
         parser.error('--patch must be a multiple of 16')
+    check_colour()
 
     clips = sorted(args.source.glob('*@1440.mp4'))[:args.limit]
     manifest = args.output / 'manifest.jsonl'
