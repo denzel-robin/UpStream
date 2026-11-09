@@ -193,6 +193,30 @@ then per-scale recalibration; `latest`). First design shown for comparison (reca
   at 180p and 5.5 / 6.8 / 8.0 ms at 360p for 3 / 6 / 9 blocks, about 1.9 ms more than the
   first design (the extra warp at output resolution). Peak 123 to 127 MiB.
 
+Why the state helps so little (`scripts/diagnose_temporal.py`, second design, the 64 test
+windows rebuilt locally, P-frames only):
+
+| Measure | x2 | x4 |
+|---|---:|---:|
+| Mean abs error to previous frame, no motion | 0.032 | 0.031 |
+| ... warped with codec MVs | **0.018** | **0.017** |
+| ... warped with MVs negated | 0.042 | 0.040 |
+| Input pixels identical to the previous frame | 48% | 48% |
+| GT frame t-1 warped onto t by MVs (PSNR) | 36.0 | 35.0 |
+| Previous model output warped onto t (PSNR) | 28.5 | 26.4 |
+| Current frame alone, no state (PSNR) | 31.6 | 28.3 |
+| Mean gate value | 0.87 | 0.88 |
+| PSNR gain from state, frames 1 to 15 | 0.00 to 0.09 | 0.16 to 0.27 |
+
+- Motion vectors are correct: warping halves the error, and negating them makes it worse.
+- The gate stays open, so the model does use the state.
+- Half of every frame is copied unchanged from the previous one (skipped blocks), so there
+  is no new information there to accumulate.
+- The warped previous output is 3 dB worse than processing the current frame alone. Block
+  motion vectors (one per 4x4 input pixels) and bilinear resampling misalign and blur it, so
+  the model can only take small corrections from it.
+- The gain appears at frame 1 and does not grow, so longer windows would not help.
+
 ## Open risks
 
 1. **Recurrent state does not help.** After full training the gate is almost closed.
