@@ -217,6 +217,27 @@ windows rebuilt locally, P-frames only):
   the model can only take small corrections from it.
 - The gain appears at frame 1 and does not grow, so longer windows would not help.
 
+Reusing unchanged regions (`scripts/simulate_skip.py --clips`, whole frames of the 18 test
+clips, 6 s each at CRF 23 and 33, second design, 9 blocks). A region is reused from the
+previous output only on P-frames where the input pixels and the motion vectors under it,
+including an 11-grid-pixel halo (the receptive field), are unchanged.
+
+| | x2 | x4 |
+|---|---:|---:|
+| Grid pixels changed | 49% | 48% |
+| Grid pixels whose output can change (changed, dilated by the halo) | 75% | 69% |
+| 16-px tiles to recompute | 81% | 76% |
+| Work left with each tile's halo (upper bound) | 96% | 95% |
+| PSNR, full / reused | 32.75 / 32.74 | 29.71 / 29.70 |
+
+- Reuse does not hurt quality (output within 80 to 90 dB of full recomputation).
+- On average it saves little: the receptive field spreads every change by 11 grid
+  pixels, so at best about 25 to 30% of work could be skipped with ideal sparse compute,
+  and about 5% with tiles on a GPU.
+- It is strongly content-dependent. Changed area per P-frame ranges from 2% to 88% by
+  clip (mean 46%); 11% of P-frames change under 10%, 4% under 1%. Mostly static streams
+  would save nearly everything.
+
 ## Open risks
 
 1. **Recurrent state does not help.** After full training the gate is almost closed.
