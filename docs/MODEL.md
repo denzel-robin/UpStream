@@ -266,8 +266,8 @@ reverses.
 Fix: the second scale now states `in_color_matrix=bt709:in_range=tv` explicitly, which
 gives bit-identical windows with the local ffmpeg. `check_colour()` runs a saturated
 solid colour through the real filter graph before any data is prepared and stops if the
-renditions disagree by more than 2 levels (a correct graph gives at most 2, from chroma
-subsampling; the old Kaggle behaviour gives 17). The data has to be rebuilt and the model
+renditions disagree by more than 5 levels (a correct graph gives 2 locally and 3 on
+Kaggle, from chroma quantisation; the old behaviour gives 17). The data has to be rebuilt and the model
 retrained.
 
 ## Third design (2026-11-09)

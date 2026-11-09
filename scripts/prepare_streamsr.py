@@ -70,11 +70,12 @@ def encode(source: Path, workdir: Path, crf: int, fps: float, seconds: float) ->
     return paths
 
 
-def check_colour(tolerance: float = 2.0) -> None:
+def check_colour(tolerance: float = 5.0) -> None:
     """Fail fast if this ffmpeg makes the inputs' colours differ from the ground truth.
 
-    A saturated solid colour goes through the real filter graph. Any colour-matrix
-    or range mismatch between the renditions moves it by several levels.
+    A saturated solid colour goes through the real filter graph. A colour-matrix
+    mismatch between the renditions moves it by about 17 levels; a correct graph is
+    within 2 to 3, from chroma quantisation (2 locally, 3 on Kaggle).
     """
     with tempfile.TemporaryDirectory() as temp:
         source = Path(temp) / 'colour.mp4'
