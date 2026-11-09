@@ -21,7 +21,7 @@ from upstream_vsr.data import WindowDataset  # noqa: E402
 from upstream_vsr.model import RepBlock, UpStreamVSR  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from train_upstream import choose_exit, scale_inputs  # noqa: E402
+from train_upstream import batch_quality, choose_exit, scale_inputs  # noqa: E402
 
 
 def scale_norms(model: UpStreamVSR, scale: int) -> list[torch.nn.BatchNorm2d]:
@@ -53,7 +53,8 @@ def calibrate(model: UpStreamVSR, loader: DataLoader, scale: int, batches: int, 
                 x, mv, intra = scale_inputs(batch, scale, t)
                 # Same pattern as training: every exit runs, state from a random exit.
                 _, state = model.step(x, mv, intra, state if use_state else None, scale,
-                                      choose_exit(len(model.exits)), all_exits=True)
+                                      choose_exit(len(model.exits)), all_exits=True,
+                                      quality=batch_quality(batch))
             seen += 1
             if seen >= batches:
                 break

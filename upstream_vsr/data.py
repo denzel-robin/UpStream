@@ -62,4 +62,5 @@ class WindowDataset(Dataset):
             sample[key] = torch.from_numpy(arrays[key].astype(np.float32).copy()).permute(0, 3, 1, 2)
         for key in ('intra2', 'intra4'):
             sample[key] = torch.from_numpy(arrays[key].astype(np.float32).copy())
+        sample['crf'] = torch.tensor(float(arrays['crf']))
         return sample

@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from upstream_vsr.data import WindowDataset  # noqa: E402
-from upstream_vsr.model import UpStreamVSR, warp  # noqa: E402
+from upstream_vsr.model import UpStreamVSR, crf_to_quality, warp  # noqa: E402
 
 
 def psnr(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -71,13 +71,14 @@ def main() -> None:
             mv = sample[f'mv{scale}'].to(device)
             intra = sample[f'intra{scale}'].to(device)
             gt = sample['gt'].to(device)
+            quality = crf_to_quality(sample['crf']).view(1).to(device)
             state, previous_output = None, None
             for t in range(lr.size(0)):
                 x, m = lr[t:t + 1], mv[t:t + 1]
                 recording[0] = state is not None  # gate is only meaningful with a real past
-                with_state, new_state = model.step(x, m, intra[t:t + 1], state, scale)
+                with_state, new_state = model.step(x, m, intra[t:t + 1], state, scale, quality=quality)
                 recording[0] = False
-                without, _ = model.step(x, m, intra[t:t + 1], None, scale)
+                without, _ = model.step(x, m, intra[t:t + 1], None, scale, quality=quality)
                 add(f'psnr_state_t{t:02d}', psnr(with_state, gt[t:t + 1]))
                 add(f'psnr_nostate_t{t:02d}', psnr(without, gt[t:t + 1]))
                 if t and not intra[t]:
@@ -95,7 +96,8 @@ def main() -> None:
                     add('current_output_nostate', psnr(without, gt[t:t + 1]))
                 state, previous_output = new_state, with_state
         result = {name: round(sums[name] / counts[name], 4) for name in sorted(sums)}
-        result['gate_mean'] = round(sum(gates) / len(gates), 4)
+        if gates:  # no gate runs at a scale without memory
+            result['gate_mean'] = round(sum(gates) / len(gates), 4)
         report[f'x{scale}'] = result
     text = json.dumps(report, indent=2)
     print(text)

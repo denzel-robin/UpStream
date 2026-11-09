@@ -25,7 +25,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from upstream_vsr.codec import decode_with_motion  # noqa: E402
 from upstream_vsr.data import WindowDataset  # noqa: E402
-from upstream_vsr.model import UpStreamVSR  # noqa: E402
+from upstream_vsr.model import UpStreamVSR, crf_to_quality  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prepare_streamsr import encode, probe  # noqa: E402
@@ -50,7 +50,7 @@ def changed_on_grid(x: torch.Tensor, previous: torch.Tensor, mv: torch.Tensor, s
 
 def window_sequences(root: Path, frames: int, scale: int, device):
     for sample in WindowDataset(root, frames, train=False):
-        yield sample[f'lr{scale}'], sample[f'mv{scale}'], sample[f'intra{scale}'], sample['gt']
+        yield sample[f'lr{scale}'], sample[f'mv{scale}'], sample[f'intra{scale}'], sample['gt'], sample['crf']
 
 
 def clip_sequences(clips: list[Path], seconds: float, crfs: list[int], scale: int, device):
@@ -71,7 +71,7 @@ def clip_sequences(clips: list[Path], seconds: float, crfs: list[int], scale: in
             mv = torch.stack([to(d.mv) for d in decoded[:n]]).permute(0, 3, 1, 2).float()
             intra = torch.tensor([float(d.is_intra) for d in decoded[:n]])
             gt = torch.stack([to(g) for g in gts[:n]]).permute(0, 3, 1, 2)
-            yield lr, mv, intra, gt
+            yield lr, mv, intra, gt, torch.tensor(float(crf))
 
 
 @torch.no_grad()
@@ -104,7 +104,8 @@ def main() -> None:
             sequences = clip_sequences(sorted(args.source.glob('*@1440.mp4')), args.seconds, args.crfs, scale, device)
         else:
             sequences = window_sequences(args.source, args.frames, scale, device)
-        for lr_all, mv_all, intra_all, gt_all in sequences:
+        for lr_all, mv_all, intra_all, gt_all, crf in sequences:
+            quality = crf_to_quality(crf).view(1).to(device)
             def frame(tensor, t):
                 value = tensor[t:t + 1].to(device)
                 return value.float() / 255 if tensor.dtype == torch.uint8 else value
@@ -112,7 +113,7 @@ def main() -> None:
             for t in range(lr_all.size(0)):
                 x, m, gt_t = frame(lr_all, t), frame(mv_all, t), frame(gt_all, t)
                 is_intra = bool(intra_all[t])
-                full, state = model.step(x, m, intra_all[t:t + 1].to(device), state, scale)
+                full, state = model.step(x, m, intra_all[t:t + 1].to(device), state, scale, quality=quality)
                 frames += 1
                 add('psnr_full', psnr(full, gt_t))
                 if t == 0 or is_intra:

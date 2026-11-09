@@ -4,6 +4,10 @@
 The no_state column runs the same weights with state reset on every frame. It is a
 quick signal of whether temporal state helps, not a substitute for ablation: a fair
 comparison needs a model trained without state.
+
+Columns ending in _temporal measure flicker: PSNR between the change from one output
+frame to the next and the same change in the ground truth. Higher means the output
+moves the way the source does; flicker the source does not have lowers it.
 """
 from __future__ import annotations
 
@@ -17,7 +21,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from upstream_vsr.data import WindowDataset  # noqa: E402
-from upstream_vsr.model import UpStreamVSR  # noqa: E402
+from upstream_vsr.model import UpStreamVSR, crf_to_quality  # noqa: E402
 
 
 def psnr(prediction: torch.Tensor, target: torch.Tensor) -> float:
@@ -26,12 +30,20 @@ def psnr(prediction: torch.Tensor, target: torch.Tensor) -> float:
     return (-10 * torch.log10(mse)).mean().item()
 
 
+def temporal_psnr(prediction: torch.Tensor, target: torch.Tensor) -> float:
+    """PSNR of frame-to-frame changes over a (T, 3, H, W) sequence."""
+    prediction = prediction.clamp(0, 1)
+    change, target_change = prediction[1:] - prediction[:-1], target[1:] - target[:-1]
+    mse = (change - target_change).pow(2).mean(dim=(1, 2, 3)).clamp_min(1e-10)
+    return (-10 * torch.log10(mse)).mean().item()
+
+
 @torch.inference_mode()
-def run_model(model, lr, mv, intra, scale, exit_index, use_state) -> torch.Tensor:
+def run_model(model, lr, mv, intra, scale, exit_index, use_state, quality) -> torch.Tensor:
     state, outputs = None, []
     for t in range(lr.size(0)):
         output, state = model.step(lr[t:t + 1], mv[t:t + 1], intra[t:t + 1],
-                                   state if use_state else None, scale, exit_index)
+                                   state if use_state else None, scale, exit_index, quality=quality)
         outputs.append(output)
     return torch.cat(outputs)
 
@@ -50,12 +62,17 @@ def evaluate_split(model, root: Path, frames: int, device, use_state: bool = Tru
             mv = sample[f'mv{scale}'].to(device)
             intra = sample[f'intra{scale}'].to(device)
             gt = sample['gt'].to(device)
+            quality = crf_to_quality(sample['crf']).view(1).to(device)
+            outputs = {}
             for mode in ('bilinear', 'bicubic'):
-                add(mode, psnr(F.interpolate(lr, scale_factor=scale, mode=mode, align_corners=False), gt))
+                outputs[mode] = F.interpolate(lr, scale_factor=scale, mode=mode, align_corners=False)
             for index, depth in enumerate(model.exits):
-                add(f'blocks{depth}', psnr(run_model(model, lr, mv, intra, scale, index, use_state), gt))
-            if use_state:
-                add('no_state', psnr(run_model(model, lr, mv, intra, scale, -1, False), gt))
+                outputs[f'blocks{depth}'] = run_model(model, lr, mv, intra, scale, index, use_state, quality)
+            if use_state and scale in model.memory_scales:
+                outputs['no_state'] = run_model(model, lr, mv, intra, scale, -1, False, quality)
+            for name, output in outputs.items():
+                add(name, psnr(output, gt))
+                add(f'{name}_temporal', temporal_psnr(output, gt))
         report[f'x{scale}'] = {name: round(value / len(dataset), 3) for name, value in totals.items()}
     return report
 

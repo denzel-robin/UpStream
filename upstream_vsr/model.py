@@ -16,6 +16,12 @@ Additions in this project:
   (output size / 4), so both modes cost about the same and state survives a
   resolution switch. Convolutions are shared between scales but BatchNorm is
   per scale, because x2 and x4 features have different statistics.
+* Motion-vector refinement: a small network corrects the codec's block motion
+  vectors per grid pixel before the state is warped.
+* Memory per scale: the temporal path can be switched off for a scale where it
+  does not pay for its cost (x2 by default).
+* Stream-quality conditioning: the encoder's CRF, known to the server, scales and
+  shifts the entry features, so the model knows how much compression to undo.
 
 The model is strictly causal: each output depends only on current and past frames.
 """
@@ -127,15 +133,26 @@ class StreamState:
 
 
 def warp(x: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
-    """Sample x at (position + flow). flow is (B, 2, H, W) in pixels, order (dx, dy)."""
+    """Sample x at (position + flow). flow is (B, 2, H, W) in pixels, order (dx, dy).
+
+    Sampling positions are always computed in float32: in float16 a position near
+    the right edge of a 1280-pixel frame is only accurate to about 0.3 pixels.
+    """
     _, _, h, w = x.shape
-    ys = torch.arange(h, dtype=x.dtype, device=x.device)
-    xs = torch.arange(w, dtype=x.dtype, device=x.device)
+    flow = flow.float()
+    ys = torch.arange(h, dtype=torch.float32, device=x.device)
+    xs = torch.arange(w, dtype=torch.float32, device=x.device)
     grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
     norm_x = 2 * (grid_x + flow[:, 0]) / max(w - 1, 1) - 1
     norm_y = 2 * (grid_y + flow[:, 1]) / max(h - 1, 1) - 1
     grid = torch.stack((norm_x, norm_y), dim=-1)
-    return F.grid_sample(x, grid, mode='bilinear', padding_mode='border', align_corners=True)
+    return F.grid_sample(x.float(), grid, mode='bilinear', padding_mode='border',
+                         align_corners=True).to(x.dtype)
+
+
+def crf_to_quality(crf: torch.Tensor | float) -> torch.Tensor:
+    """Map an x264 CRF onto roughly [0, 1] over the training range 18 to 33."""
+    return (torch.as_tensor(crf, dtype=torch.float32) - 18) / 15
 
 
 class UpStreamVSR(nn.Module):
@@ -144,15 +161,30 @@ class UpStreamVSR(nn.Module):
     Args:
         num_feat: feature channels on the grid.
         exits: cumulative block counts, one per anytime exit, ascending.
+        memory_scales: scales that use the temporal path. Other scales still pass
+            state on, so a later switch to a memory scale can use it.
+        refine_motion: correct codec motion vectors per grid pixel before warping.
+        quality_conditioning: condition the features on the stream's CRF.
+
+    The defaults reproduce the second design, so its checkpoints load unchanged.
     """
 
-    def __init__(self, num_feat: int = 32, exits: Sequence[int] = (3, 6, 9)):
+    max_refinement = 2.0  # grid pixels the refinement may move the codec vector
+
+    def __init__(self, num_feat: int = 32, exits: Sequence[int] = (3, 6, 9),
+                 memory_scales: Sequence[int] = SCALES, refine_motion: bool = False,
+                 quality_conditioning: bool = False):
         super().__init__()
         exits = tuple(exits)
         if not exits or list(exits) != sorted(set(exits)) or exits[0] < 1:
             raise ValueError('exits must be strictly ascending positive block counts')
+        if not set(memory_scales) <= set(SCALES):
+            raise ValueError(f'memory_scales must be a subset of {SCALES}')
         self.num_feat = num_feat
         self.exits = exits
+        self.memory_scales = tuple(memory_scales)
+        self.refine_motion = refine_motion
+        self.quality_conditioning = quality_conditioning
         self.entry = nn.ModuleDict({
             'x2': RepBlock(3 * 4, num_feat, scales=(2,)),  # pixel-unshuffled onto the grid
             'x4': RepBlock(3, num_feat, scales=(4,)),
@@ -169,6 +201,23 @@ class UpStreamVSR(nn.Module):
         # Current features, warped hidden state and the warped previous output
         # (space-to-depth onto the grid) are mixed by one cheap 1x1 conv.
         self.fusion = nn.Conv2d(2 * num_feat + 48, num_feat, 1)
+        if refine_motion:
+            # Sees current and warped features and pixels; predicts a correction in
+            # grid pixels. Zero-initialised, so training starts from the codec vectors.
+            self.refine = nn.Sequential(
+                nn.Conv2d(2 * num_feat + 6, 16, 3, padding=1),
+                nn.LeakyReLU(0.1, inplace=True),
+                nn.Conv2d(16, 2, 3, padding=1),
+                nn.Tanh(),
+            )
+            nn.init.zeros_(self.refine[2].weight)
+            nn.init.zeros_(self.refine[2].bias)
+        if quality_conditioning:
+            # Per-channel scale and shift from the CRF; zero-initialised to identity.
+            self.condition = nn.Sequential(nn.Linear(1, 16), nn.LeakyReLU(0.1, inplace=True),
+                                           nn.Linear(16, 2 * num_feat))
+            nn.init.zeros_(self.condition[2].weight)
+            nn.init.zeros_(self.condition[2].bias)
         self.blocks = nn.ModuleList(RepBlock(num_feat, num_feat) for _ in range(exits[-1]))
         self.exit_adapters = nn.ModuleList(nn.Conv2d(num_feat, num_feat, 1) for _ in exits)
         for adapter in self.exit_adapters:
@@ -192,6 +241,7 @@ class UpStreamVSR(nn.Module):
         scale: int,
         exit_index: int = -1,
         all_exits: bool = False,
+        quality: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | list[torch.Tensor], StreamState]:
         """Reconstruct one frame.
 
@@ -204,6 +254,8 @@ class UpStreamVSR(nn.Module):
             scale: 2 or 4. May change between frames while keeping the state.
             exit_index: which anytime exit to use; its features and output become the state.
             all_exits: also return every other exit's output (for training).
+            quality: (B,) stream quality from crf_to_quality; required when the
+                model was built with quality_conditioning.
 
         Returns:
             (output, new_state), where output is (B, 3, H*scale, W*scale), or a list
@@ -220,25 +272,17 @@ class UpStreamVSR(nn.Module):
             raise ValueError(f'scale must be one of {SCALES}, got {scale}')
 
         b, _, h, w = feat.shape
-        intra = is_intra.to(x.dtype).view(b, 1, 1, 1).expand(b, 1, h, w)
+        if self.quality_conditioning:
+            if quality is None:
+                raise ValueError('this model needs the stream quality (crf_to_quality)')
+            film = self.condition(quality.to(feat.dtype).view(b, 1))
+            gamma, beta = film.view(b, 2, -1, 1, 1).unbind(dim=1)
+            feat = feat * (1 + gamma) + beta
         base = F.interpolate(x, scale_factor=scale, mode='bilinear', align_corners=False)
-        if state is None:
-            warped_hidden = feat.new_zeros(feat.shape)
-            warped_previous = grid_x
-            warped_output = base
+        if scale in self.memory_scales:
+            out = feat + self._fuse_memory(feat, grid_x, flow, mv, is_intra, state, base, scale)
         else:
-            warped_hidden = warp(state.hidden, flow)
-            warped_previous = warp(state.previous, flow)
-            output_flow = F.interpolate(mv, size=base.shape[-2:], mode='nearest') * scale
-            warped_output = warp(state.output, output_flow)
-
-        # The motion-compensation error stands in for the codec residual: it is
-        # available without a patched decoder and also flags occlusions and bad MVs.
-        error = (grid_x - warped_previous).abs().mean(dim=1, keepdim=True)
-        gate = self.gate(torch.cat((error, intra), dim=1))
-        past = torch.cat((warped_hidden, F.pixel_unshuffle(warped_output, 4)), dim=1)
-        out = feat + self.fusion(torch.cat((feat, gate * past), dim=1))
-
+            out = feat
         exit_index %= len(self.exits)
         wanted = range(len(self.exits)) if all_exits else (exit_index,)
         outputs, hidden = {}, None
@@ -255,6 +299,41 @@ class UpStreamVSR(nn.Module):
         if all_exits:
             return [outputs[index] for index in wanted], new_state
         return outputs[exit_index], new_state
+
+    def _fuse_memory(self, feat, grid_x, flow, mv, is_intra, state, base, scale) -> torch.Tensor:
+        """Align the previous frame's features and output, gate them, and mix them in."""
+        b, _, h, w = feat.shape
+        intra = is_intra.to(feat.dtype).view(b, 1, 1, 1).expand(b, 1, h, w)
+        if state is None:
+            warped_hidden = feat.new_zeros(feat.shape)
+            warped_previous = grid_x
+            warped_output = base
+        else:
+            warped_hidden = warp(state.hidden, flow)
+            warped_previous = warp(state.previous, flow)
+            if self.refine_motion:
+                cues = torch.cat((feat, warped_hidden, grid_x, warped_previous), dim=1)
+                flow = flow + self.max_refinement * self.refine(cues)
+                warped_hidden = warp(state.hidden, flow)
+                warped_previous = warp(state.previous, flow)
+                # One grid pixel is four output pixels. Bilinear upsampling also
+                # smooths the steps between neighbouring codec blocks.
+                output_flow = F.interpolate(flow, scale_factor=4, mode='bilinear', align_corners=False) * 4
+            else:
+                output_flow = F.interpolate(mv, size=base.shape[-2:], mode='nearest') * scale
+            warped_output = warp(state.output, output_flow)
+
+        # The motion-compensation error stands in for the codec residual: it is
+        # available without a patched decoder and also flags occlusions and bad MVs.
+        error = (grid_x - warped_previous).abs().mean(dim=1, keepdim=True)
+        gate = self.gate(torch.cat((error, intra), dim=1))
+        past = torch.cat((warped_hidden, F.pixel_unshuffle(warped_output, 4)), dim=1)
+        return self.fusion(torch.cat((feat, gate * past), dim=1))
+
+    def config(self) -> dict:
+        return {'num_feat': self.num_feat, 'exits': list(self.exits),
+                'memory_scales': list(self.memory_scales), 'refine_motion': self.refine_motion,
+                'quality_conditioning': self.quality_conditioning}
 
     def load_checkpoint_state(self, state: dict[str, torch.Tensor]) -> None:
         self.load_state_dict(upgrade_state_dict(self, state))

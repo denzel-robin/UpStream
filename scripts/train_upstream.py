@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from upstream_vsr.data import WindowDataset  # noqa: E402
-from upstream_vsr.model import UpStreamVSR  # noqa: E402
+from upstream_vsr.model import UpStreamVSR, crf_to_quality  # noqa: E402
 
 
 def endless(loader):
@@ -54,6 +54,11 @@ def scale_inputs(batch: dict, scale: int, t: int) -> tuple[torch.Tensor, torch.T
     return batch[f'lr{key}'][:, t], batch[f'mv{key}'][:, t], batch[f'intra{key}'][:, t]
 
 
+def batch_quality(batch: dict) -> torch.Tensor:
+    """(B,) stream quality for the model's CRF conditioning."""
+    return crf_to_quality(batch['crf']).to(batch['gt'].device)
+
+
 def frame_loss(output: torch.Tensor, target: torch.Tensor, edge_weight: float) -> torch.Tensor:
     loss = charbonnier(output, target)
     if edge_weight:
@@ -67,19 +72,29 @@ def train_sequence(model, batch, args) -> torch.Tensor:
     Every exit is scored on every frame, so the deepest exit gets as much training
     as the shallowest. The state passed on comes from a randomly chosen exit, so it
     stays usable whichever exit the live pipeline picks.
+
+    The temporal term compares the change between consecutive outputs with the
+    change between consecutive ground-truth frames, so flicker the source does not
+    have is penalised. It is valid across a resolution switch: outputs are 720p.
     """
     frames = batch['gt'].size(1)
     scale = random.choice((2, 4))
     switch_at = random.randrange(1, frames) if random.random() < args.switch_probability else None
-    state, loss = None, 0.0
+    quality = batch_quality(batch)
+    state, loss, previous = None, 0.0, None
     for t in range(frames):
         if t == switch_at:
             scale = 6 - scale
         x, mv, intra = scale_inputs(batch, scale, t)
         outputs, state = model.step(x, mv, intra, None if args.no_state else state, scale,
-                                    choose_exit(len(model.exits)), all_exits=True)
+                                    choose_exit(len(model.exits)), all_exits=True, quality=quality)
         target = batch['gt'][:, t]
         loss = loss + sum(frame_loss(output, target, args.edge_weight) for output in outputs) / len(outputs)
+        if args.temporal_weight and previous is not None:
+            change = target - batch['gt'][:, t - 1]
+            loss = loss + args.temporal_weight * sum(
+                charbonnier(output - before, change) for output, before in zip(outputs, previous)) / len(outputs)
+        previous = outputs
     return loss / frames
 
 
@@ -96,7 +111,8 @@ def validate(model, loader, device, exits_to_check, use_state=True) -> dict[str,
                 state = None
                 for t in range(batch['gt'].size(1)):
                     x, mv, intra = scale_inputs(batch, scale, t)
-                    output, state = model.step(x, mv, intra, state if use_state else None, scale, exit_index)
+                    output, state = model.step(x, mv, intra, state if use_state else None, scale, exit_index,
+                                               quality=batch_quality(batch))
                     mse = (output.clamp(0, 1) - batch['gt'][:, t]).pow(2).mean(dim=(1, 2, 3))
                     errors.append(mse.clamp_min(1e-10))
             psnr = (-10 * torch.log10(torch.cat(errors))).mean().item()
@@ -115,7 +131,14 @@ def main() -> None:
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--num-feat', type=int, default=32)
     parser.add_argument('--exits', type=int, nargs='+', default=[3, 6, 9])
+    parser.add_argument('--memory-scales', type=int, nargs='*', default=[4],
+                        help='scales that use the temporal path (none: --memory-scales with no values)')
+    parser.add_argument('--no-refine-motion', dest='refine_motion', action='store_false')
+    parser.add_argument('--no-quality', dest='quality_conditioning', action='store_false',
+                        help='do not condition on the stream CRF')
     parser.add_argument('--edge-weight', type=float, default=0.1)
+    parser.add_argument('--temporal-weight', type=float, default=0.0,
+                        help='weight of the frame-to-frame change loss against flicker')
     parser.add_argument('--switch-probability', type=float, default=0.3)
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--val-every', type=int, default=2000)
@@ -135,7 +158,8 @@ def main() -> None:
                               num_workers=args.workers, pin_memory=True, persistent_workers=args.workers > 0)
     val_loader = DataLoader(val_set, args.batch_size, num_workers=args.workers, pin_memory=True)
 
-    model = UpStreamVSR(args.num_feat, args.exits).to(device)
+    model = UpStreamVSR(args.num_feat, args.exits, args.memory_scales, args.refine_motion,
+                        args.quality_conditioning).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.iterations, eta_min=1e-7)
     scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
@@ -160,8 +184,8 @@ def main() -> None:
         torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(), 'scaler': scaler.state_dict(),
                     'iteration': iteration, 'best': best,
-                    'config': {'num_feat': args.num_feat, 'exits': args.exits},
-                    'no_state': args.no_state}, temporary)
+                    'config': model.config(), 'no_state': args.no_state,
+                    'temporal_weight': args.temporal_weight}, temporary)
         temporary.replace(path)
 
     log = (args.output / 'log.jsonl').open('a')

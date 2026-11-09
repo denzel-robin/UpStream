@@ -201,7 +201,7 @@ def test_calibration_only_changes_the_calibrated_scale():
     batch = {'lr2': x.unsqueeze(1).repeat(1, frames, 1, 1, 1) * 5,
              'mv2': mv.unsqueeze(1).repeat(1, frames, 1, 1, 1),
              'intra2': intra.unsqueeze(1).repeat(1, frames),
-             'gt': torch.zeros(2, frames, 3, 128, 192)}
+             'gt': torch.zeros(2, frames, 3, 128, 192), 'crf': torch.full((2,), 23.0)}
     calibrate(model, [batch], 2, batches=2, device=torch.device('cpu'))
     assert torch.equal(model.blocks[0].bn3['x4'].running_mean, before_x4)
     assert not torch.equal(model.blocks[0].bn3['x2'].running_mean, before_x2)
@@ -229,3 +229,89 @@ def test_previous_output_survives_resolution_switch():
         x2, mv2, _ = inputs(2)
         out2, switched = model.step(x2, mv2, intra, state, 2)
     assert state.output.shape == switched.output.shape == out2.shape == out4.shape
+
+
+def v3(**overrides):
+    options = dict(num_feat=8, exits=(1, 2), memory_scales=(4,), refine_motion=True, quality_conditioning=True)
+    options.update(overrides)
+    return UpStreamVSR(**options)
+
+
+def test_defaults_keep_the_second_design_layout():
+    names = set(UpStreamVSR(num_feat=8, exits=(1, 2)).state_dict())
+    assert not any(name.startswith(('refine.', 'condition.')) for name in names)
+
+
+def test_config_round_trip():
+    model = v3()
+    assert set(UpStreamVSR(**model.config()).state_dict()) == set(model.state_dict())
+
+
+def test_quality_is_required_when_conditioned():
+    x, mv, intra = inputs(4)
+    with pytest.raises(ValueError):
+        v3().eval().step(x, mv, intra, None, 4)
+
+
+def test_untrained_conditioning_and_refinement_are_identity():
+    """Zero-initialised: the quality value and the refinement change nothing at the start."""
+    torch.manual_seed(0)
+    model = v3(memory_scales=(2, 4)).eval()
+    torch.nn.init.normal_(model.heads['x4'][0].weight, std=.01)
+    x, mv, intra = inputs(4)
+    with torch.no_grad():
+        _, state = model.step(x, mv, intra, None, 4, quality=torch.zeros(2))
+        a, _ = model.step(x, mv, intra, state, 4, quality=torch.zeros(2))
+        b, _ = model.step(x, mv, intra, state, 4, quality=torch.ones(2))
+    assert torch.equal(a, b)
+
+
+def test_scale_without_memory_ignores_state_but_passes_it_on():
+    torch.manual_seed(0)
+    model = v3().eval()
+    for module in (model.heads['x2'][0], model.heads['x4'][0]):
+        torch.nn.init.normal_(module.weight, std=.01)
+    quality = torch.full((2,), .5)
+    x4, mv4, intra = inputs(4)
+    x2, mv2, _ = inputs(2, seed=1)
+    with torch.no_grad():
+        _, state = model.step(x4, mv4, intra, None, 4, quality=quality)
+        with_state, carried = model.step(x2, mv2, intra, state, 2, quality=quality)
+        without, _ = model.step(x2, mv2, intra, None, 2, quality=quality)
+        assert torch.equal(with_state, without)
+        assert carried.output.shape == state.output.shape
+        model.step(x4, mv4, intra, carried, 4, quality=quality)  # x4 can use what x2 passed on
+
+
+def test_refinement_gets_gradient():
+    torch.manual_seed(0)
+    model = v3().train()
+    torch.nn.init.normal_(model.refine[2].weight, std=.01)
+    torch.nn.init.normal_(model.heads['x4'][0].weight, std=.01)
+    quality = torch.full((2,), .5)
+    x, mv, intra = inputs(4)
+    _, state = model.step(x, mv, intra, None, 4, quality=quality)
+    output, _ = model.step(x, mv, intra, state, 4, quality=quality)
+    output.mean().backward()
+    assert model.refine[0].weight.grad.abs().sum() > 0
+
+
+def test_fused_v3_matches_training_structure():
+    torch.manual_seed(0)
+    model = v3().train()
+    quality = torch.full((2,), .5)
+    for scale in (2, 4):
+        for _ in range(3):
+            x, mv, intra = inputs(scale)
+            model.step(x, mv, intra, None, scale, quality=quality)
+    for head in model.heads.values():
+        torch.nn.init.normal_(head[0].weight, std=.01)
+    model.eval()
+    x, mv, intra = inputs(4)
+    with torch.no_grad():
+        _, state = model.step(x, mv, intra, None, 4, quality=quality)
+        expected, _ = model.step(x, mv, intra, state, 4, quality=quality)
+        model.fuse()
+        _, state = model.step(x, mv, intra, None, 4, quality=quality)
+        actual, _ = model.step(x, mv, intra, state, 4, quality=quality)
+    assert torch.allclose(actual, expected, atol=1e-5)

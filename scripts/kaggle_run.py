@@ -222,6 +222,8 @@ def train(args: argparse.Namespace) -> None:
         command += ['--val-every', args.val_every]
     if args.no_state:
         command += ['--no-state']
+    command += ['--num-feat', args.num_feat, '--exits', *args.exits,
+                '--temporal-weight', args.temporal_weight]
     run(*command)
     # Training statistics follow the last few batches; recompute them before scoring.
     for name in ('latest', 'best'):
@@ -265,6 +267,9 @@ def main() -> None:
     fit.add_argument('--frames', type=int, default=12)
     fit.add_argument('--val-every', type=int)
     fit.add_argument('--no-state', action='store_true', help='ablation: train without recurrent state')
+    fit.add_argument('--num-feat', type=int, default=32)
+    fit.add_argument('--exits', type=int, nargs='+', default=[3, 6, 9])
+    fit.add_argument('--temporal-weight', type=float, default=0.0)
     cal = commands.add_parser('calibrate')
     cal.add_argument('--batches', type=int, default=100, help='batches of training windows per scale')
     args = parser.parse_args()

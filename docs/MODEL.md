@@ -238,6 +238,74 @@ including an 11-grid-pixel halo (the receptive field), are unchanged.
   clip (mean 46%); 11% of P-frames change under 10%, 4% under 1%. Mostly static streams
   would save nearly everything.
 
+## Colour mismatch in the Kaggle data (2026-11-09)
+
+**All results above were measured on training, validation and test inputs whose colours
+were wrong.** They are not valid for the live pipeline.
+
+`prepare_streamsr.py` scales the source to 720p (tagged BT.709) and then downscales that
+again for the x2 and x4 inputs. Kaggle's ffmpeg does not carry the BT.709 matrix into the
+second scale and assumes BT.601, so the inputs' colours and brightness are shifted while
+the ground truth is correct. The local ffmpeg (9.0.2) carries the matrix forward.
+
+How it was found and confirmed:
+
+- On test windows rebuilt locally, the second design is 0.13 dB *below* bicubic at x2
+  (31.73 against 31.86) and only 0.63 dB above it at x4 (28.61 against 27.98). The same
+  code on Kaggle's copy of the test set gives +1.72 and +1.51 dB.
+- Ground truth is bit-identical between the two copies; only the inputs differ. The
+  Kaggle inputs are darker by 1 to 13 levels depending on content, and luma PSNR of the
+  input against the downscaled ground truth is 32.0 dB on Kaggle against 35.7 dB locally.
+- Rebuilding one test clip locally with `in_color_matrix=bt601` forced on the second
+  scale reproduces Kaggle's inputs **bit for bit**.
+
+So the models learned partly to undo a colour error that live inputs do not have. On
+correct inputs that correction is wrong, which is why the gain over bicubic shrinks or
+reverses.
+
+Fix: the second scale now states `in_color_matrix=bt709:in_range=tv` explicitly, which
+gives bit-identical windows with the local ffmpeg. `check_colour()` runs a saturated
+solid colour through the real filter graph before any data is prepared and stops if the
+renditions disagree by more than 2 levels (a correct graph gives at most 2, from chroma
+subsampling; the old Kaggle behaviour gives 17). The data has to be rebuilt and the model
+retrained.
+
+## Third design (2026-11-09)
+
+Changes, all from the measurements above:
+
+| Change | Why | Cost |
+|---|---|---|
+| **Motion-vector refinement**: a small net (conv 3x3 70 to 16, conv 3x3 16 to 2, tanh) sees current and warped features and pixels and corrects the codec vector by up to 2 grid pixels per grid pixel; the 720p flow is upsampled bilinearly instead of in 4x4 steps. Zero-initialised | The warped previous output was 3 dB worse than the current frame alone | about 10k parameters |
+| **Memory only at x4** (`memory_scales`). x2 frames still pass state on, so a switch to x4 can use it | State gave 0.01 dB at x2 for 1.9 ms | saves time at x2 |
+| **CRF conditioning**: the stream's CRF, which the server knows, sets a per-channel scale and shift of the entry features (FiLM). Zero-initialised | Tells the model how much compression to undo, which matters most at the low bitrates where x2 and x4 have to beat direct 720p | about 1k parameters |
+| **Flicker loss** (`--temporal-weight 0.05`): Charbonnier on the change between consecutive outputs against the change between consecutive ground-truth frames | With state, the second design flickered slightly more than with state reset (below) | none at inference |
+| **Width test**: a second run with 48 channels and exits at 2/4/6 | Depth added only 0.13 to 0.18 dB, so width may be the limit | slower, see below |
+
+Sampling positions in `warp` are always float32, so half-precision inference does not
+misplace samples (in float16 a position near the right edge of 1280 pixels is only
+accurate to about 0.3 pixels).
+
+Flicker, second design on the locally rebuilt test windows (PSNR of frame-to-frame
+change against the ground truth's change; higher is steadier):
+
+| | Bicubic | 9 blocks | 9 blocks, state reset |
+|---|---:|---:|---:|
+| x2 | 37.32 | 37.51 | 37.61 |
+| x4 | 35.00 | 35.12 | 35.44 |
+
+Cost on the RTX 3050 Laptop (untrained weights, fused, synthetic input with zero motion;
+ms per frame for the three exits):
+
+| | x2 | x4 | Deployed parameters | Peak MiB |
+|---|---|---|---:|---:|
+| Second design | 5.5 / 6.8 / 8.0 | 5.4 / 6.6 / 7.9 | 205,601 | 127 |
+| Third, 32 channels, exits 3/6/9 | 3.3 / 4.5 / 5.8 | 6.7 / 7.9 / 9.1 | 217,107 | 148 |
+| Third, 48 channels, exits 2/4/6 | 5.4 / 7.9 / 10.3 | 9.4 / 11.9 / 14.3 | 328,451 | 182 |
+
+Training notebooks: `kaggle/4_train_v3.ipynb` and `kaggle/4b_train_v3_wide.ipynb`, after
+the data is rebuilt with notebook 1.
+
 ## Open risks
 
 1. **Recurrent state does not help.** After full training the gate is almost closed.

@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from upstream_vsr.model import UpStreamVSR  # noqa: E402
+from upstream_vsr.model import SCALES, UpStreamVSR  # noqa: E402
 
 INPUT_SIZE = {4: (180, 320), 2: (360, 640)}
 
@@ -30,10 +30,11 @@ def time_upstream(model, device, scale, exit_index, frames) -> dict:
     x = torch.rand(1, 3, h, w, device=device)
     mv = torch.zeros(1, 2, h // 4, w // 4, device=device)
     intra = torch.zeros(1, device=device)
+    quality = torch.full((1,), 0.5, device=device)
     state, times = None, []
     for index in range(frames + 20):
         begin = time.perf_counter()
-        output, state = model.step(x, mv, intra, state, scale, exit_index)
+        output, state = model.step(x, mv, intra, state, scale, exit_index, quality=quality)
         output.clamp(0, 1)
         if device.type == 'cuda':
             torch.cuda.synchronize()
@@ -67,6 +68,9 @@ def main() -> None:
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--num-feat', type=int, default=32)
     parser.add_argument('--exits', type=int, nargs='+', default=[3, 6, 9])
+    parser.add_argument('--memory-scales', type=int, nargs='*', default=list(SCALES))
+    parser.add_argument('--refine-motion', action='store_true')
+    parser.add_argument('--quality', action='store_true', help='include CRF conditioning')
     parser.add_argument('--frames', type=int, default=300)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--nanovsr-root', type=Path, help='path to an external/nanovsr checkout')
@@ -74,7 +78,7 @@ def main() -> None:
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    model = UpStreamVSR(args.num_feat, args.exits)
+    model = UpStreamVSR(args.num_feat, args.exits, args.memory_scales, args.refine_motion, args.quality)
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
         model = UpStreamVSR(**checkpoint['config'])
