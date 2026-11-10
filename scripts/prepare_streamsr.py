@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from upstream_vsr.codec import decode_with_motion  # noqa: E402
 
 CRFS = (18, 23, 28, 33)
+CLIP_TIMEOUT = 900  # seconds; one clip takes well under a minute
 X264 = ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-threads', '1',
         '-x264-params', 'keyint=30:min-keyint=30:scenecut=0:bframes=0:ref=1',
         '-pix_fmt', 'yuv420p', '-colorspace', 'bt709', '-color_primaries', 'bt709',
@@ -70,12 +71,16 @@ def encode(source: Path, workdir: Path, crf: int, fps: float, seconds: float) ->
     return paths
 
 
-def check_colour(tolerance: float = 5.0) -> None:
+def check_colour(tolerance: float = 5.0) -> str | None:
     """Fail fast if this ffmpeg makes the inputs' colours differ from the ground truth.
 
     A saturated solid colour goes through the real filter graph. A colour-matrix
     mismatch between the renditions moves it by about 17 levels; a correct graph is
     within 2 to 3, from chroma quantisation (2 locally, 3 on Kaggle).
+
+    Returns an error message, or None. Run it in a pool worker, not in the parent:
+    decoding starts libav threads, and forking a process that has them can deadlock
+    the workers.
     """
     with tempfile.TemporaryDirectory() as temp:
         source = Path(temp) / 'colour.mp4'
@@ -89,10 +94,11 @@ def check_colour(tolerance: float = 5.0) -> None:
     for name in ('lr2', 'lr4'):
         error = np.abs(means[name] - means['gt']).max()
         if error > tolerance:
-            raise SystemExit(f'{name} colours differ from the ground truth by {error:.1f} levels '
-                             f'(gt {means["gt"].round(1)}, {name} {means[name].round(1)}); '
-                             'this ffmpeg build would produce mismatched training data')
+            return (f'{name} colours differ from the ground truth by {error:.1f} levels '
+                    f'(gt {means["gt"].round(1)}, {name} {means[name].round(1)}); '
+                    'this ffmpeg build would produce mismatched training data')
     print('colour check passed', {name: value.round(1).tolist() for name, value in means.items()}, flush=True)
+    return None
 
 
 def choose_windows(total: int, length: int, count: int, rng: random.Random) -> list[int]:
@@ -210,7 +216,6 @@ def main() -> None:
     args = parser.parse_args()
     if args.patch % 16:
         parser.error('--patch must be a multiple of 16')
-    check_colour()
 
     clips = sorted(args.source.glob('*@1440.mp4'))[:args.limit]
     manifest = args.output / 'manifest.jsonl'
@@ -223,7 +228,18 @@ def main() -> None:
     counts = {'windows': 0, 'skipped': 0, 'remaining': len(jobs)}
     started = time.monotonic()
     with manifest.open('a') as log, multiprocessing.Pool(args.workers) as pool:
-        for entry in pool.imap_unordered(process_clip, jobs):
+        error = pool.apply(check_colour)
+        if error:
+            raise SystemExit(error)
+        entries = pool.imap_unordered(process_clip, jobs)
+        while True:
+            try:
+                entry = entries.next(timeout=CLIP_TIMEOUT)
+            except StopIteration:
+                break
+            except multiprocessing.TimeoutError:
+                pool.terminate()
+                raise SystemExit(f'no clip finished in {CLIP_TIMEOUT // 60} minutes; workers are stuck')
             counts['windows'] += entry['windows']
             counts['skipped'] += entry['status'] != 'ok'
             counts['remaining'] -= 1
