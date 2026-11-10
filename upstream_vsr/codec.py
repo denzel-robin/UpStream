@@ -42,14 +42,35 @@ def rasterize_motion_vectors(vectors: np.ndarray | None, height: int, width: int
     return field
 
 
+def to_decoded(frame: av.VideoFrame) -> DecodedFrame:
+    """RGB, motion field and frame type, converted exactly as the training data was."""
+    side = frame.side_data.get('MOTION_VECTORS')
+    vectors = side.to_ndarray() if side is not None else None
+    rgb = frame.reformat(format='rgb24', src_colorspace='ITU709').to_ndarray()
+    field = rasterize_motion_vectors(vectors, frame.height, frame.width)
+    return DecodedFrame(rgb, field, int(frame.pict_type) == AV_PICTURE_TYPE_I)
+
+
 def decode_with_motion(path: str | Path) -> Iterator[DecodedFrame]:
     """Yield frames in presentation order with their motion fields."""
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         stream.codec_context.options = {'flags2': '+export_mvs'}
         for frame in container.decode(stream):
-            side = frame.side_data.get('MOTION_VECTORS')
-            vectors = side.to_ndarray() if side is not None else None
-            rgb = frame.reformat(format='rgb24', src_colorspace='ITU709').to_ndarray()
-            field = rasterize_motion_vectors(vectors, frame.height, frame.width)
-            yield DecodedFrame(rgb, field, int(frame.pict_type) == AV_PICTURE_TYPE_I)
+            yield to_decoded(frame)
+
+
+class MotionDecoder:
+    """Decode H.264 one packet at a time, as the live client receives them.
+
+    Single-threaded on purpose: frame threading would hold frames back. The stream
+    must have no B-frames, so every packet yields its frame immediately.
+    """
+
+    def __init__(self) -> None:
+        self.context = av.CodecContext.create('h264', 'r')
+        self.context.options = {'flags2': '+export_mvs'}
+        self.context.thread_count = 1
+
+    def decode(self, data: bytes) -> list[DecodedFrame]:
+        return [to_decoded(frame) for frame in self.context.decode(av.Packet(data))]

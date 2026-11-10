@@ -29,13 +29,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from upstream_vsr.codec import decode_with_motion  # noqa: E402
+from upstream_vsr.encoding import X264, filter_graph  # noqa: E402
 
 CRFS = (18, 23, 28, 33)
 CLIP_TIMEOUT = 900  # seconds; one clip takes well under a minute
-X264 = ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-threads', '1',
-        '-x264-params', 'keyint=30:min-keyint=30:scenecut=0:bframes=0:ref=1',
-        '-pix_fmt', 'yuv420p', '-colorspace', 'bt709', '-color_primaries', 'bt709',
-        '-color_trc', 'bt709', '-color_range', 'tv']
 
 
 def probe(path: Path) -> tuple[int, int, float] | None:
@@ -51,17 +48,9 @@ def probe(path: Path) -> tuple[int, int, float] | None:
 
 
 def encode(source: Path, workdir: Path, crf: int, fps: float, seconds: float) -> dict[str, Path]:
-    # 45+ fps sources are halved so that frame spacing resembles the 30 fps live stream.
-    step = 'framestep=2,' if fps >= 45 else ''
-    scale = ':flags=area+accurate_rnd:out_color_matrix=bt709:out_range=tv'
-    # The second scale must be told its input is BT.709. Older ffmpeg (as on Kaggle)
-    # does not carry the first scale's output matrix forward and assumes BT.601,
-    # which shifts the colours of the low-resolution inputs but not the ground truth.
-    rescale = scale + ':in_color_matrix=bt709:in_range=tv'
     paths = {name: workdir / f'{name}.{ext}' for name, ext in
              (('gt', 'nut'), ('lr2', 'mp4'), ('lr4', 'mp4'))}
-    graph = (f'[0:v]{step}scale=1280:720{scale},format=yuv444p,split=3[gt][a][b];'
-             f'[a]scale=640:360{rescale}[lr2];[b]scale=320:180{rescale}[lr4]')
+    graph = filter_graph(fps)
     command = ['ffmpeg', '-v', 'error', '-y', '-t', str(seconds), '-i', str(source),
                '-filter_complex', graph,
                '-map', '[gt]', '-c:v', 'ffv1', '-colorspace', 'bt709', '-color_range', 'tv', str(paths['gt']),

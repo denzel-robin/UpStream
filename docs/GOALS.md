@@ -37,8 +37,8 @@ Complete a live video upscaling pipeline that balances four things:
 | # | Milestone | Status |
 |---|---|---|
 | 1 | Model, codec motion extraction, data preparation, training and benchmark scripts | Done |
-| 2 | Prepare the full StreamSR data and train on Kaggle | In progress: earlier results are invalid because Kaggle's ffmpeg shifted the inputs' colours (fixed; see docs/MODEL.md). Data to be rebuilt, then the third design trained at 32 and 48 channels |
-| 3 | Live integration: motion vectors from the decoder, per-frame depth, separate reconstruction and display threads | Not started |
+| 2 | Prepare the full StreamSR data and train on Kaggle | In progress: earlier results are invalid because Kaggle's ffmpeg shifted the inputs' colours (fixed; see docs/MODEL.md). Data rebuilt and verified; third design training at 32 channels, 48 channels after the quota reset |
+| 3 | Live integration: motion vectors from the decoder, per-frame depth, separate reconstruction and display threads | Done for one machine (docs/LIVE.md): frames ready 12 to 13 ms after release, no drops, switches on keyframes; rerun with the third design once trained |
 | 4 | Trade-off controller with mid-stream resolution and bitrate switching | Not started |
 | 5 | Evaluation with shaped network conditions, ablation of each technique, sustained run | Not started |
 | 6 | Report (must explain how the four-way trade-off works and how and why the pipeline switches between direct, x2 and x4, with measured results) and final demo | Not started |
