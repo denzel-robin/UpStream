@@ -151,3 +151,100 @@ python scripts/compare_modes.py data/test-clips/NRqG3AEOVGg@1440.mp4 \
     data/test-clips/LjOrDJOjSMg@1440.mp4 data/test-clips/vT7XBbyKssI@1440.mp4 --half
 # results/compare/summary.json, results/compare/<clip>/table.md, per-run reports
 ```
+
+## Over a real network path (tc netem, 2026-11-11)
+
+The same comparison over real TCP. The client runs in a network namespace, joined
+to the server by a veth pair (`live/netem.py`, `scripts/run_netem.sh`). netem shapes
+the server-to-client direction: the same rate schedule, plus delay, jitter, loss and a
+300-packet router queue. The return direction gets the same delay, jitter and loss.
+Offloads are off, so netem shapes real 1500-byte packets. Both ends share one clock,
+so latency is still exact.
+
+| Profile | One-way delay | Jitter | Loss | Packets lost (measured) |
+|---|---|---|---|---|
+| broadband | 20 ms | 5 ms | 0.1% | 11 of 20,444 |
+| mobile | 40 ms | 15 ms | 1% | 115 of 14,496 |
+
+Mean of the three clips, all four quantities:
+
+| | direct | x2 | x4 | adaptive |
+|---|---:|---:|---:|---:|
+| **Broadband** | | | | |
+| Viewer PSNR, dB | 27.77 | 28.33 | 28.55 | **30.47** |
+| Viewer PSNR at 2500 / 500 / 1500 | **35.92** / 18.88 / 28.51 | 34.94 / 20.33 / 29.73 | 30.54 / **25.46** / 29.64 | 35.11 / 24.48 / **31.82** |
+| Latency p50 / p95 / max, ms | 150 / 159 / 426 | 156 / 163 / 409 | 156 / **157** / 420 | 155 / 167 / 694 |
+| Frames shown / late / skipped | 1824 / 29 / 847 | 1993 / 45 / 662 | **2555 / 16 / 129** | 2288 / 44 / 368 |
+| Longest freeze, ms | 4678 | 4633 | **967** | 2278 |
+| Payload, kbit/s | 471 | 491 | **385** | 545 |
+| Model GPU time, % / power, W | **0 / 12.9** | 13.9 / 20.3 | 27.6 / 24.7 | 15.3 / 21.3 |
+| **Mobile** | | | | |
+| Viewer PSNR, dB | 24.04 | 26.53 | 25.95 | **27.44** |
+| Viewer PSNR at 2500 / 500 / 1500 | 32.04 / 16.25 / 23.83 | **33.18** / 18.64 / **27.77** | 29.51 / 23.51 / 24.84 | 31.79 / **24.70** / 25.82 |
+| Latency p50 / p95 / max, ms | 151 / 377 / 1255 | 156 / 214 / 438 | 156 / **186** / **285** | 155 / 217 / 1267 |
+| Frames shown / late / skipped | 1344 / 95 / 1261 | 1640 / 131 / 929 | **1900** / 74 / **726** | 1811 / 113 / 776 |
+| Longest freeze, ms | 6222 | 4522 | **1389** | 2378 |
+| Payload, kbit/s | 302 | 310 | **250** | 363 |
+| Model GPU time, % / power, W | **0 / 12.8** | 13.6 / 19.7 | 21.7 / 22.7 | 13.6 / 20.6 |
+
+Viewer PSNR per clip:
+
+| Clip | Profile | direct | x2 | x4 | adaptive |
+|---|---|---:|---:|---:|---:|
+| NRqG3AEOVGg | broadband | 25.40 | 25.89 | 29.68 | **31.33** |
+| LjOrDJOjSMg | broadband | 26.89 | 29.24 | **29.28** | 28.68 |
+| vT7XBbyKssI | broadband | 31.02 | 29.86 | 26.68 | **31.41** |
+| NRqG3AEOVGg | mobile | 21.89 | 24.62 | 26.36 | **27.64** |
+| LjOrDJOjSMg | mobile | 22.74 | 24.67 | **26.72** | 25.66 |
+| vT7XBbyKssI | mobile | 27.49 | **30.31** | 24.79 | 29.02 |
+
+Frames per rendition chosen by adaptive, all three clips, per link phase:
+
+| Profile | Link | direct | x2 | x4 | skipped |
+|---|---|---:|---:|---:|---:|
+| broadband | 2500 | 464 | 300 | 90* | 46 |
+| | 500 | 17 | 145 | 451 | 287 |
+| | 1500 | 25 | 720 | 120 | 35 |
+| mobile | 2500 | 410 | 146 | 90* | 254 |
+| | 500 | 19 | 129 | 568 | 184 |
+| | 1500 | 59 | 408 | 95 | 338 |
+
+\*The first 30 frames of every run are the starting rung, x4@28.
+
+### What the real network shows
+
+- **Adaptive has the best mean on both real profiles**: 1.9 dB ahead of the next mode on
+  broadband, 0.9 dB on mobile. On the emulated link it tied with x2. Real TCP punishes
+  the fixed high-rate modes harder.
+- **Direct-only collapses when the link is below its cheapest rung.** On clip A at
+  500 kbit/s, direct@43 costs 710 kbit/s, so the guard drops every group and only
+  one keyframe per second gets through. That gave a 4.7 s freeze on broadband and
+  6.2 s on mobile.
+- **x4 is the most robust mode under loss**: the fewest late and skipped frames and the
+  shortest freezes on both profiles. Its frames are small, so a retransmission delays
+  less.
+- **Adaptive switches to x4 when the link drops.** At 500 kbit/s it used x4 for 451
+  (broadband) and 568 (mobile) of the frames it sent. It uses x2 at 1500 and direct at
+  2500.
+- **Loss costs latency.** With 1% loss and an 80 ms round trip, p95 latency rises
+  from about 160 ms (broadband) to 186–377 ms. A lost packet stalls everything behind it
+  for at least one round trip (TCP head-of-line blocking). Late frames rise two- to
+  five-fold, and skips rise even at 2500 kbit/s.
+
+### A weakness this exposed (not yet fixed)
+
+When only keyframes get through (every group dropped), no packet finds the link idle
+twice within the fit window. The client then has no capacity estimate, and the server
+guard keeps the last one it was sent. On clip A, direct-only kept dropping groups from
+20 s, when the link rose to 1500, until 25 s.
+
+Proposed fix: estimate capacity from a single keyframe that found the link idle, as
+size / (delay - fixed delay). Also expire the guard's capacity when the client stops
+updating it.
+
+### Commands
+
+```bash
+sudo bash scripts/run_netem.sh smoke   # 8 s check
+sudo bash scripts/run_netem.sh full    # both profiles, about 25 minutes
+```
