@@ -48,12 +48,20 @@ from upstream_vsr.codec import decode_with_motion  # noqa: E402
 from upstream_vsr.encoding import frame_step, ladder_graph  # noqa: E402
 from prepare_streamsr import probe  # noqa: E402
 
+ALL = ['direct', 'x2', 'x4']
+# name: (renditions, start rung, extra client arguments, extra server arguments)
 MODES = {
-    'direct': (['direct'], 'direct@33'),
-    'x2': (['x2'], 'x2@28'),
-    'x4': (['x4'], 'x4@28'),
-    'adaptive': (['direct', 'x2', 'x4'], 'x4@28'),
+    'direct': (['direct'], 'direct@33', [], []),
+    'x2': (['x2'], 'x2@28', [], []),
+    'x4': (['x4'], 'x4@28', [], []),
+    'adaptive': (ALL, 'x4@28', [], []),
+    # Ablations: adaptive with one part taken away (docs/ABLATION.md)
+    'adaptive-bicubic': (ALL, 'x4@28', ['--upscaler', 'bicubic'], []),
+    'adaptive-fixed-depth': (ALL, 'x4@28', ['--fixed-exit', '-1'], []),
+    'adaptive-no-gpu-awareness': (ALL, 'x4@28', ['--no-gpu-awareness'], []),
+    'adaptive-no-guard': (ALL, 'x4@28', [], ['--no-guard']),
 }
+DEFAULT_MODES = ['direct', 'x2', 'x4', 'adaptive']
 PYTHON = sys.executable
 
 
@@ -180,7 +188,7 @@ def give_back(path: Path) -> None:
 
 
 def run_mode(args, source: Path, mode: str, out: Path, port: int) -> tuple[dict, dict]:
-    renditions, start = MODES[mode]
+    renditions, start, client_extra, server_extra = MODES[mode]
     out.mkdir(parents=True, exist_ok=True)
     give_back(args.out)
     phases = parse_link(args.link)
@@ -191,7 +199,7 @@ def run_mode(args, source: Path, mode: str, out: Path, port: int) -> tuple[dict,
     host = HOST_IP if args.netem else '127.0.0.1'
     command = [*as_user(), PYTHON, str(ROOT / 'live/server.py'), str(source), '--seconds', str(args.seconds),
                '--crfs', '18', '23', '28', '33', '--direct-crfs', '23', '28', '33', '38', '43', '--start', start,
-               '--host', host, '--port', str(port), '--report', str(out / 'server.json')]
+               '--host', host, '--port', str(port), '--report', str(out / 'server.json'), *server_extra]
     if not args.netem:
         command += ['--link', args.link]
     server = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -210,13 +218,20 @@ def run_mode(args, source: Path, mode: str, out: Path, port: int) -> tuple[dict,
     reader = threading.Thread(target=drain_output, daemon=True)
     reader.start()
     schedule = path.follow(phases, started, stop) if path else None
+    load = None
+    if args.gpu_load:  # another application on the viewer's GPU, running for the whole stream
+        size, busy, idle = args.gpu_load.split(',')
+        load = subprocess.Popen([*as_user(), PYTHON, str(ROOT / 'scripts/gpu_load.py'), '--size', size,
+                                 '--busy-ms', busy, '--idle-ms', idle], stdout=subprocess.PIPE, text=True)
+        load.stdout.readline()
     gpu_log = open(out / 'gpu.csv', 'w')
     sampler = subprocess.Popen(['nvidia-smi', '--query-gpu=timestamp,utilization.gpu,power.draw,temperature.gpu,memory.used',
                                 '--format=csv,noheader,nounits', '-lms', '200'], stdout=gpu_log)
     try:
         command = [*as_user(), PYTHON, str(ROOT / 'live/client.py'), '--checkpoint', str(args.checkpoint), '--controller',
                    '--renditions', *renditions, '--playout-delay', str(args.playout_delay), '--host', host,
-                   '--port', str(port), '--record', str(out / 'frames.raw'), '--report', str(out / 'client.json')]
+                   '--port', str(port), '--record', str(out / 'frames.raw'), '--report', str(out / 'client.json'),
+                   *client_extra]
         if args.netem:
             command = ['ip', 'netns', 'exec', NAMESPACE, *command]
         if args.half:
@@ -225,6 +240,9 @@ def run_mode(args, source: Path, mode: str, out: Path, port: int) -> tuple[dict,
     finally:
         sampler.terminate()
         sampler.wait()
+        if load is not None:
+            load.terminate()
+            load.wait()
         gpu_log.close()
         server.wait(timeout=60)
         reader.join(timeout=10)
@@ -283,7 +301,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('sources', type=Path, nargs='+')
     parser.add_argument('--checkpoint', type=Path, default=ROOT / 'runs/kaggle-6-v3/run/best-calibrated.pt')
-    parser.add_argument('--modes', nargs='+', default=list(MODES), choices=list(MODES))
+    parser.add_argument('--modes', nargs='+', default=DEFAULT_MODES, choices=list(MODES))
     parser.add_argument('--link', default='0:2500,10:500,20:1500')
     parser.add_argument('--seconds', type=float, default=30)
     parser.add_argument('--playout-delay', type=float, default=0.15)
@@ -291,6 +309,8 @@ def main() -> None:
     parser.add_argument('--keep-frames', action='store_true', help='keep the raw recordings (2.5 GB per 30 s run)')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/compare')
     parser.add_argument('--port', type=int, default=8810)
+    parser.add_argument('--gpu-load', help='background GPU load during each run, as size,busy_ms,idle_ms '
+                        '(scripts/gpu_load.py), for example 8192,200,5')
     parser.add_argument('--netem', action='store_true',
                         help='real TCP over a veth pair shaped by tc netem (needs root: run under sudo)')
     parser.add_argument('--path', type=PathConditions.parse, default=PathConditions(),
@@ -302,7 +322,7 @@ def main() -> None:
 
     phases = parse_link(args.link)
     everything, port = {'link': phases, 'seconds': args.seconds, 'playout_delay_s': args.playout_delay,
-                        'half': args.half, 'checkpoint': str(args.checkpoint), 'clips': {},
+                        'half': args.half, 'checkpoint': str(args.checkpoint), 'clips': {}, 'gpu_load': args.gpu_load,
                         'network': ({'kind': 'netem', **vars(args.path)} if args.netem else {'kind': 'emulated link'})}, args.port
     try:
         for source in args.sources:

@@ -14,6 +14,7 @@ class DepthPolicy:
         self.margin = margin
         self.smoothing = smoothing
         self.expected: dict[tuple[int, int], float] = {}
+        self.fixed: int | None = None  # ablation: always this exit, whatever the time left
 
     def update(self, scale: int, exit_index: int, seconds: float) -> None:
         key = (scale, exit_index)
@@ -25,6 +26,8 @@ class DepthPolicy:
         return min(time_left, self.frame_interval) - self.margin
 
     def choose(self, scale: int, time_left: float) -> int:
+        if self.fixed is not None:
+            return self.fixed
         budget = self.budget(time_left)
         for exit_index in reversed(range(self.num_exits)):
             expected = self.expected.get((scale, exit_index))

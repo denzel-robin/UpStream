@@ -91,6 +91,19 @@ def test_controller_credits_the_deepest_exit_that_fits():
     assert controller.quality('x2@23') == TABLE['x2@23']['psnr'][1]  # 25 ms > 20 ms budget
 
 
+def test_ablation_without_gpu_awareness_credits_the_deepest_exit_even_when_too_slow():
+    slow = {2: (30.0, 40.0, 50.0), 4: (30.0, 40.0, 50.0)}
+    controller = TradeoffController(TABLE, LADDER, 1 / 30, 0.1, policy=policy_with(slow), gpu_aware=False)
+    assert controller.quality('x2@23') == TABLE['x2@23']['psnr'][2]
+
+
+def test_ablation_fixed_exit_ignores_the_time_left():
+    policy = policy_with({4: (8.0, 12.0, 30.0)})
+    assert policy.choose(4, 0.02) == 1
+    policy.fixed = 2
+    assert policy.choose(4, 0.001) == 2
+
+
 def test_controller_goes_to_x4_on_a_tight_link():
     controller = TradeoffController(TABLE, LADDER, 1 / 30, 0.1, policy=policy_with(FAST))
     controller.start('x2@28', 0.0)

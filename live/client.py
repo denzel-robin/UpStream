@@ -75,8 +75,10 @@ def parse_schedule(text: str | None) -> list[tuple[int, str]]:
 class Reconstructor:
     """Holds the model and its recurrent state; one call per decoded frame."""
 
-    def __init__(self, model: UpStreamVSR | None, device: torch.device, policy: DepthPolicy | None, half: bool):
+    def __init__(self, model: UpStreamVSR | None, device: torch.device, policy: DepthPolicy | None, half: bool,
+                 bicubic: bool = False):
         self.model, self.device, self.policy, self.half = model, device, policy, half
+        self.bicubic = bicubic  # ablation: bicubic in place of the model, same rung choices
         self.dtype = torch.float16 if half else torch.float32
         self.state = None
         self.last_scale = None
@@ -114,6 +116,14 @@ class Reconstructor:
         self.policy.update(scale, exit_index, seconds)
         return frame, seconds
 
+    @torch.inference_mode()
+    def upscale_bicubic(self, rgb: np.ndarray, scale: int) -> tuple[np.ndarray, dict]:
+        begin = time.perf_counter()
+        x = self.to_device(rgb, 1 / 255)
+        y = torch.nn.functional.interpolate(x, scale_factor=scale, mode='bicubic', align_corners=False)
+        frame = y[0].clamp(0, 1).mul(255).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+        return frame, {'exit': None, 'model_s': time.perf_counter() - begin, 'bicubic': True}
+
     def __call__(self, item: dict, time_left: float) -> tuple[np.ndarray, dict]:
         scale = SCALE[item['rendition']]
         if scale == 1 or self.model is None:
@@ -123,6 +133,8 @@ class Reconstructor:
         if self.last_scale == 1:
             self.state = None
         self.last_scale = scale
+        if self.bicubic:
+            return self.upscale_bicubic(item['rgb'], scale)
         exit_index = self.policy.choose(scale, time_left)
         frame, seconds = self.run(item['rgb'], item['mv'], item['is_intra'], scale, exit_index, item['crf'])
         return frame, {'exit': exit_index, 'model_s': seconds}
@@ -192,13 +204,16 @@ def run(args: argparse.Namespace) -> dict:
         raise SystemExit('use --schedule or --controller, not both')
     report = {'checkpoint': str(args.checkpoint) if args.checkpoint else None, 'half': args.half,
               'playout_delay_s': args.playout_delay, 'drop_late_s': args.drop_late,
-              'schedule': schedule, 'frames': [], 'errors': [], 'skipped': 0, 'guard': []}
+              'schedule': schedule, 'frames': [], 'errors': [], 'skipped': 0, 'guard': [],
+              'ablation': {'upscaler': args.upscaler, 'fixed_exit': args.fixed_exit, 'gpu_aware': args.gpu_aware}}
     policy = None
-    reconstruct = Reconstructor(model, device, None, args.half)
+    reconstruct = Reconstructor(model, device, None, args.half, bicubic=args.upscaler == 'bicubic')
     if model is not None:
         report['model_config'] = model.config()
         # Frame interval is not known until the header; 30 fps until then.
         policy = reconstruct.policy = DepthPolicy(len(model.exits), 1 / 30)
+        if args.fixed_exit is not None:
+            policy.fixed = args.fixed_exit % len(model.exits)
         warm = time.perf_counter()
         reconstruct.warm_up()
         report['warm_up_s'] = time.perf_counter() - warm
@@ -226,7 +241,8 @@ def run(args: argparse.Namespace) -> dict:
         controller = TradeoffController(
             load_table(args.rate_quality), ladder, 1 / fps,
             latency_budget_s=max(args.playout_delay - args.processing_margin, 0.01), policy=policy,
-            gpu_share=args.gpu_share, deadline_s=args.playout_delay + args.drop_late - args.processing_margin)
+            gpu_share=args.gpu_share, deadline_s=args.playout_delay + args.drop_late - args.processing_margin,
+            gpu_aware=args.gpu_aware)
         controller.start(header['start'], time.monotonic())
         report['controller'] = {'gpu_share': args.gpu_share, 'latency_budget_s': controller.latency_budget_s,
                                 'rate_quality': str(args.rate_quality), 'ladder': ladder}
@@ -467,6 +483,11 @@ def main() -> None:
     parser.add_argument('--drop-late', type=float, default=0.05, help='skip showing a frame this much past due')
     parser.add_argument('--queue', type=int, default=8, help='frames each stage may buffer')
     parser.add_argument('--half', action='store_true', help='float16 inference')
+    parser.add_argument('--upscaler', choices=['model', 'bicubic'], default='model',
+                        help='ablation: bicubic upscales x2/x4 frames instead of UpStreamVSR (the controller is unchanged)')
+    parser.add_argument('--fixed-exit', type=int, help='ablation: always this exit (-1 = deepest), not the anytime choice')
+    parser.add_argument('--no-gpu-awareness', dest='gpu_aware', action='store_false',
+                        help='ablation: the controller assumes the deepest exit always fits')
     parser.add_argument('--display', action='store_true', help='show the video in a window (Escape closes it)')
     parser.add_argument('--no-hud', dest='hud', action='store_false', help='with --display: no status overlay')
     parser.add_argument('--compare', action='store_true',

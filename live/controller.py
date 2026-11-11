@@ -183,7 +183,7 @@ class TradeoffController:
                  congestion_s: float = 0.04,
                  probe_s: float = 4.0, min_gain_db: float = 0.1, keyint: int = 30, rate_memory: int = 3,
                  up_hold_s: float = 2.0,
-                 tie_db: float = 0.05, deadline_s: float | None = None) -> None:
+                 tie_db: float = 0.05, deadline_s: float | None = None, gpu_aware: bool = True) -> None:
         missing = [name for name in ladder if name not in table]
         if missing:
             raise ValueError(f'rate-quality table has no entry for {missing}')
@@ -194,6 +194,7 @@ class TradeoffController:
         # may wait up to it and still be shown, as the P-frames behind a keyframe do.
         self.deadline_s = latency_budget_s if deadline_s is None else max(deadline_s, latency_budget_s)
         self.gpu_share, self.headroom, self.stay_headroom = gpu_share, headroom, stay_headroom
+        self.gpu_aware = gpu_aware  # ablation: False credits every rung with the deepest exit
         self.congestion_s = congestion_s
         self.probe_s = probe_s
         self.min_gain_db, self.tie_db = min_gain_db, tie_db
@@ -235,6 +236,8 @@ class TradeoffController:
         """Deepest exit whose measured time fits the GPU share; None if none does."""
         if self.policy is None:
             return None
+        if not self.gpu_aware:
+            return self.policy.num_exits - 1
         budget = self.gpu_share * self.frame_interval
         fitting = [e for e in range(self.policy.num_exits) if self.policy.expected.get((scale, e), float('inf')) <= budget]
         return max(fitting) if fitting else None

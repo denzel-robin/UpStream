@@ -121,7 +121,7 @@ def serve(args: argparse.Namespace) -> dict:
     report = {'source': str(args.source), 'fps': fps, 'crf': args.crf, 'ladder': names, 'start': start,
               'link': link_schedule, 'switches': [], 'frames_by_rung': {}, 'bytes_by_rung': {},
               'late_releases': 0, 'max_release_lag_s': 0.0, 'skipped': 0, 'backlog_skips': 0,
-              'max_backlog_ms': args.max_backlog_ms, 'requests': [], 'max_encoder_lead_s': 0.0}
+              'max_backlog_ms': args.max_backlog_ms, 'guard': args.guard, 'requests': [], 'max_encoder_lead_s': 0.0}
 
     with socket.socket() as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -220,7 +220,7 @@ def serve(args: argparse.Namespace) -> dict:
                 # picture for longer than the late frames would.
                 waiting, rate = backlog_bytes(conn, link), client_kbps[0]
                 growing = waiting + len(packets[current].data) > previous_backlog
-                if rate and index > 0 and growing and waiting * 8 / (rate * 1000) > limit_ms[0] / 1000:
+                if args.guard and rate and index > 0 and growing and waiting * 8 / (rate * 1000) > limit_ms[0] / 1000:
                     skipping[0] = True
                     channel.send_json(b'G', {'frame': index, 'capacity_kbps': rate, 'backlog_bytes': waiting})
                     report['backlog_skips'] += 1
@@ -265,6 +265,8 @@ def main() -> None:
     parser.add_argument('--max-backlog-ms', type=float, default=100,
                         help='skip to the next keyframe rather than queue more than this in the network, '
                              'until the client sends its latency budget')
+    parser.add_argument('--no-guard', dest='guard', action='store_false',
+                        help='ablation: never drop frames for the sender backlog')
     parser.add_argument('--link', help='emulated bottleneck, kbit/s from each second on, for example 0:3000,10:600')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8766)
