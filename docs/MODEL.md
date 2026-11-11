@@ -306,19 +306,56 @@ ms per frame for the three exits):
 Training notebooks: `kaggle/4_train_v3.ipynb` and `kaggle/4b_train_v3_wide.ipynb`, after
 the data is rebuilt with notebook 1.
 
+## Third design, trained (2026-11-11)
+
+Kaggle run `upstream-6-v3`: 32 channels, exits 3/6/9, flicker weight 0.05, 70,000
+iterations in 7.9 hours on the rebuilt data (1,940 training windows). Validation PSNR was
+still rising slowly at the end (x4 deepest exit: 28.50 at 66k, 28.51 at 70k), so the run
+is close to converged. Checkpoint: `runs/kaggle-6-v3/run/best-calibrated.pt`.
+
+Test set (64 windows, correct colours), PSNR in dB:
+
+| | Bicubic | Exit 1 | Exit 2 | Exit 3 | Gain over bicubic | Second design |
+|---|---:|---:|---:|---:|---:|---:|
+| x2 | 31.86 | 32.61 | 32.67 | 32.68 | **+0.82** | 31.73 (-0.13) |
+| x4 | 27.98 | 29.02 | 29.11 | 29.13 | **+1.15** | 28.61 (+0.63) |
+
+Validation (207 windows) agrees: +0.87 at x2, +1.07 at x4.
+
+Flicker (PSNR of frame-to-frame change, higher is steadier):
+
+| | Bicubic | Exit 3 | Exit 3, state reset |
+|---|---:|---:|---:|
+| x2 | 37.32 | 37.75 | (no memory at x2) |
+| x4 | 35.00 | 35.29 | 35.58 |
+
+What this shows:
+
+- **The model now beats bicubic at both scales**, by more at x4, where there is more to
+  recover. The second design lost to bicubic at x2 once the colour error was removed.
+- **Memory now helps quality**: resetting the state costs 0.22 dB at x4 (29.13 to 28.91).
+  In the second design it gave almost nothing. Motion-vector refinement is the likely
+  reason; the ablation will separate it from the other changes.
+- **Memory still adds a little flicker** (35.29 against 35.58 with state reset), though
+  the output is now steadier than bicubic. A higher flicker weight would trade some
+  PSNR for steadiness.
+- **Depth still gives a small range**: exit 1 to exit 3 is 0.07 dB at x2 and 0.11 dB at
+  x4. The cheapest exit keeps 90% of the gain, which is good for the controller under
+  load, but the anytime range is narrow.
+
+Live run, same setup as docs/LIVE.md: 300 frames, none dropped; ready 13.5 ms after
+release in float32 and 12.0 ms in float16; model 10.9 / 8.8 ms at x4 and 7.6 / 5.6 ms at
+x2 (float32 / float16, deepest exit).
+
 ## Open risks
 
-1. **Recurrent state does not help.** After full training the gate is almost closed.
-   Possible causes: raw deep features are added straight onto entry features, motion
-   vectors cover 16-pixel cells, and the shared BatchNorm problem above. The design of the
-   temporal path needs to change, or the report has to say it gives no benefit.
-2. **Depth gives a small range** (about 0.1 dB after recalibration). Three blocks is
-   nearly as good as nine, so the controller can always afford good quality, but the
-   anytime claim is weak unless deeper exits gain more after the next training run.
+1. **Memory adds flicker.** It now gives 0.22 dB at x4 but makes the output slightly less
+   steady than with state reset. Try a higher flicker weight in the 48-channel run.
+2. **Depth gives a small range** (0.07 to 0.11 dB from first to last exit). The width
+   run tests whether more channels widen it.
 3. **Direct delivery may still win.** The earlier study found it beat NanoVSR at matched
-   rates at 360p playback. The real test is rate-quality against direct delivery at 720p.
-4. **Per-scale BatchNorm during training is untested.** Recalibration confirmed the
-   cause; the next training run will be the first with per-scale BatchNorm from the start.
+   rates at 360p playback. The real test is rate-quality against direct delivery at 720p
+   (milestone 4).
 
 ## Training on Kaggle
 
