@@ -134,3 +134,13 @@ def test_link_schedule_must_start_at_zero():
     assert parse_link('10:500,0:2000') == [(0.0, 2000.0), (10.0, 500.0)]
     with pytest.raises(ValueError):
         parse_link('5:1000')
+
+
+def test_netem_path_conditions_build_tc_arguments():
+    from live.netem import PathConditions
+    path = PathConditions.parse('delay=40,jitter=15,loss=1,limit=200')
+    assert path.netem(500) == ['netem', 'delay', '40.0ms', '15.0ms', 'distribution', 'normal', 'loss', '1.0%',
+                               'rate', '500kbit', 'limit', '200']
+    assert 'rate' not in PathConditions(jitter_ms=0, loss_pct=0).netem(None)
+    with pytest.raises(ValueError):
+        PathConditions.parse('latency=20')

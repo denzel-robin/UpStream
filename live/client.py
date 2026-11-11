@@ -33,6 +33,14 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+if '--display' in sys.argv:
+    # OpenCV's Qt window must load before PyAV (imported by upstream_vsr.codec): PyAV
+    # bundles its own libxcb, and Qt then hangs opening the window on that copy.
+    import os
+    os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')  # the wheel has no Wayland plugin; XWayland works
+    os.environ.setdefault('QT_LOGGING_RULES', 'qt.qpa.*=false;qt.text.font.db=false')
+    import cv2  # noqa: F401
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -153,7 +161,30 @@ class Recorder:
         self.file.close()
 
 
+def open_window(name: str):
+    """Open the display window before the worker threads start (cv2 is imported at the
+    top of this module, ahead of PyAV, when --display is given)."""
+    import cv2
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    cv2.waitKey(1)
+    return cv2
+
+
+def overlay(cv2, frame: np.ndarray, lines: list[str]) -> np.ndarray:
+    """Status text on a dark band at the top-left of a BGR frame."""
+    scale = frame.shape[0] / 720
+    height = int((14 + 26 * len(lines)) * scale)
+    width = int(min(frame.shape[1], 700 * scale))
+    band = frame[:height, :width]
+    band[:] = (band * 0.35).astype(np.uint8)
+    for i, text in enumerate(lines):
+        cv2.putText(frame, text, (int(10 * scale), int((30 + 26 * i) * scale)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.62 * scale, (255, 255, 255), max(1, int(1.4 * scale)), cv2.LINE_AA)
+    return frame
+
+
 def run(args: argparse.Namespace) -> dict:
+    cv2 = open_window('UpStream live') if args.display else None
     device = torch.device(args.device)
     model = load_model(args.checkpoint, device, args.half) if args.checkpoint else None
     schedule = parse_schedule(args.schedule)
@@ -287,6 +318,8 @@ def run(args: argparse.Namespace) -> dict:
             started = time.monotonic()
             frame, info = reconstruct(item, due(item['index']) - started)
             item.update(info, started=started, reconstructed=time.monotonic(), output=frame)
+            if args.compare and item['rendition'] != 'direct':
+                item['input'] = item['rgb']  # for the bicubic half of the side-by-side view
             del item['rgb'], item['mv']
             shown.put(item)
 
@@ -298,11 +331,9 @@ def run(args: argparse.Namespace) -> dict:
     for thread in threads:
         thread.start()
 
-    window = None
-    if args.display:
-        import cv2
-        window = 'UpStream live'
-        cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
+    window = 'UpStream live' if cv2 is not None else None
+    recent_bytes: list[tuple[float, int]] = []
+    late_count = 0
     try:
         while (item := shown.get()) is not END:
             target = due(item['index'])
@@ -311,11 +342,36 @@ def run(args: argparse.Namespace) -> dict:
                 time.sleep(wait)
             late = time.monotonic() - target
             dropped = late > args.drop_late
+            late_count += dropped
+            now = time.monotonic()
+            recent_bytes = [(t, b) for t, b in recent_bytes if t > now - 1.0] + [(now, item['bytes'])]
             if not dropped and window:
-                import cv2
-                cv2.imshow(window, cv2.cvtColor(item.pop('output'), cv2.COLOR_RGB2BGR))
+                picture = cv2.cvtColor(item.pop('output'), cv2.COLOR_RGB2BGR)
+                name = rung_name(item['rendition'], item['crf'])
+                size = {'direct': '720p', 'x2': '360p', 'x4': '180p'}[item['rendition']]
+                if item['exit'] is None:
+                    model = 'no model (sent as 720p)'
+                else:
+                    model = f"UpStreamVSR {size} -> 720p, exit {item['exit'] + 1}, {item['model_s'] * 1000:.1f} ms"
+                capacity = f'{controller.capacity:.0f} kbit/s' if controller and controller.capacity else 'measuring'
+                lines = [f'{name}   {model}',
+                         f'sent {sum(b for _, b in recent_bytes) * 8 / 1000:.0f} kbit/s   link estimate {capacity}',
+                         f"latency {(now - anchor[0] - item['index'] / fps) * 1000:.0f} ms   frame {item['index']}   "
+                         f"late {late_count}"]
+                if args.compare:
+                    if 'input' in item:
+                        left = cv2.resize(cv2.cvtColor(item.pop('input'), cv2.COLOR_RGB2BGR),
+                                          (picture.shape[1], picture.shape[0]), interpolation=cv2.INTER_CUBIC)
+                        left_label = f'bicubic from {size}'
+                    else:
+                        left, left_label = picture.copy(), 'direct 720p'
+                    picture = np.hstack([overlay(cv2, left, [left_label]), overlay(cv2, picture, lines)])
+                elif args.hud:
+                    picture = overlay(cv2, picture, lines)
+                cv2.imshow(window, picture)
                 if cv2.waitKey(1) & 255 == 27:
                     raise KeyboardInterrupt('closed with Escape')
+            item.pop('input', None)
             output = item.pop('output', None)
             if recorder is not None and output is not None:
                 item['recorded'] = recorder.add(output)
@@ -411,7 +467,10 @@ def main() -> None:
     parser.add_argument('--drop-late', type=float, default=0.05, help='skip showing a frame this much past due')
     parser.add_argument('--queue', type=int, default=8, help='frames each stage may buffer')
     parser.add_argument('--half', action='store_true', help='float16 inference')
-    parser.add_argument('--display', action='store_true', help='show the video in a window')
+    parser.add_argument('--display', action='store_true', help='show the video in a window (Escape closes it)')
+    parser.add_argument('--no-hud', dest='hud', action='store_false', help='with --display: no status overlay')
+    parser.add_argument('--compare', action='store_true',
+                        help='with --display: bicubic from the received frame on the left, UpStreamVSR on the right')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--connect-timeout', type=float, default=30)
     parser.add_argument('--report', type=Path)

@@ -190,6 +190,7 @@ def serve(args: argparse.Namespace) -> dict:
                 now = time.monotonic()
                 if t0 is None:
                     t0 = report['t0'] = now
+                    print('STREAMING', flush=True)  # frame 0 leaves now: a network schedule starts here
                     if link is not None:
                         link.start_clock()
                 elif (wait := t0 + index / fps - now) > 0:

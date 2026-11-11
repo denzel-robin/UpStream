@@ -29,9 +29,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -41,6 +43,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / 'scripts'))
 from live.link import parse_link  # noqa: E402
+from live.netem import CLIENT_IP, HOST_IP, NAMESPACE, NetemPath, PathConditions  # noqa: E402
 from upstream_vsr.codec import decode_with_motion  # noqa: E402
 from upstream_vsr.encoding import frame_step, ladder_graph  # noqa: E402
 from prepare_streamsr import probe  # noqa: E402
@@ -156,25 +159,61 @@ def rung_usage(client: dict, fps: float) -> dict:
             'switches': len(client['summary'].get('switches', []))}
 
 
+def as_user() -> list[str]:
+    """Under sudo, run children as the invoking user (their files, their CUDA context)."""
+    user = os.environ.get('SUDO_USER')
+    if os.geteuid() != 0 or not user:
+        return []
+    keep = [f'{k}={os.environ[k]}' for k in ('PYTHONPATH', 'PATH') if k in os.environ]
+    return ['sudo', '-u', user, 'env', f'HOME={os.path.expanduser("~" + user)}', *keep]
+
+
+def give_back(path: Path) -> None:
+    """Files written as root under sudo go back to the invoking user."""
+    if os.geteuid() == 0 and 'SUDO_UID' in os.environ:
+        subprocess.run(['chown', '-R', f"{os.environ['SUDO_UID']}:{os.environ['SUDO_GID']}", str(path)], check=False)
+
+
 def run_mode(args, source: Path, mode: str, out: Path, port: int) -> tuple[dict, dict]:
     renditions, start = MODES[mode]
     out.mkdir(parents=True, exist_ok=True)
-    server = subprocess.Popen(
-        [PYTHON, str(ROOT / 'live/server.py'), str(source), '--seconds', str(args.seconds), '--crfs', '18', '23', '28', '33',
-         '--direct-crfs', '23', '28', '33', '38', '43', '--link', args.link, '--start', start, '--port', str(port),
-         '--report', str(out / 'server.json')], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    give_back(args.out)
+    phases = parse_link(args.link)
+    path = None
+    if args.netem:
+        path = NetemPath(args.path)
+        path.setup(phases[0][1])  # a fresh, empty router queue for every run
+    host = HOST_IP if args.netem else '127.0.0.1'
+    command = [*as_user(), PYTHON, str(ROOT / 'live/server.py'), str(source), '--seconds', str(args.seconds),
+               '--crfs', '18', '23', '28', '33', '--direct-crfs', '23', '28', '33', '38', '43', '--start', start,
+               '--host', host, '--port', str(port), '--report', str(out / 'server.json')]
+    if not args.netem:
+        command += ['--link', args.link]
+    server = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in server.stdout:
         if line.startswith('READY'):
             break
     else:
         raise RuntimeError(f'server for {mode} did not start')
+    started, stop = threading.Event(), threading.Event()
+
+    def drain_output() -> None:
+        for line in server.stdout:
+            if line.startswith('STREAMING'):
+                started.set()
+
+    reader = threading.Thread(target=drain_output, daemon=True)
+    reader.start()
+    schedule = path.follow(phases, started, stop) if path else None
     gpu_log = open(out / 'gpu.csv', 'w')
     sampler = subprocess.Popen(['nvidia-smi', '--query-gpu=timestamp,utilization.gpu,power.draw,temperature.gpu,memory.used',
                                 '--format=csv,noheader,nounits', '-lms', '200'], stdout=gpu_log)
     try:
-        command = [PYTHON, str(ROOT / 'live/client.py'), '--checkpoint', str(args.checkpoint), '--controller',
-                   '--renditions', *renditions, '--playout-delay', str(args.playout_delay), '--port', str(port),
-                   '--record', str(out / 'frames.raw'), '--report', str(out / 'client.json')]
+        command = [*as_user(), PYTHON, str(ROOT / 'live/client.py'), '--checkpoint', str(args.checkpoint), '--controller',
+                   '--renditions', *renditions, '--playout-delay', str(args.playout_delay), '--host', host,
+                   '--port', str(port), '--record', str(out / 'frames.raw'), '--report', str(out / 'client.json')]
+        if args.netem:
+            command = ['ip', 'netns', 'exec', NAMESPACE, *command]
         if args.half:
             command.append('--half')
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
@@ -182,8 +221,15 @@ def run_mode(args, source: Path, mode: str, out: Path, port: int) -> tuple[dict,
         sampler.terminate()
         sampler.wait()
         gpu_log.close()
-        server.stdout.read()
         server.wait(timeout=60)
+        reader.join(timeout=10)
+        stop.set()
+        if path is not None:
+            schedule.join(timeout=5)
+            (out / 'network.json').write_text(json.dumps({
+                'conditions': vars(args.path), 'server_ip': HOST_IP, 'client_ip': CLIENT_IP,
+                'rate_applied': path.applied, 'tc_statistics': path.statistics()}, indent=1) + '\n')
+        give_back(args.out)
     return json.loads((out / 'client.json').read_text()), json.loads((out / 'server.json').read_text())
 
 
@@ -240,44 +286,57 @@ def main() -> None:
     parser.add_argument('--keep-frames', action='store_true', help='keep the raw recordings (2.5 GB per 30 s run)')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/compare')
     parser.add_argument('--port', type=int, default=8810)
+    parser.add_argument('--netem', action='store_true',
+                        help='real TCP over a veth pair shaped by tc netem (needs root: run under sudo)')
+    parser.add_argument('--path', type=PathConditions.parse, default=PathConditions(),
+                        help='with --netem: one-way delay and jitter (ms), loss (%%), router queue (packets), '
+                             'for example delay=20,jitter=5,loss=0.1,limit=300')
     args = parser.parse_args()
+    if args.netem and os.geteuid() != 0:
+        raise SystemExit('--netem needs root to create the namespace and shape it; run under sudo')
 
     phases = parse_link(args.link)
     everything, port = {'link': phases, 'seconds': args.seconds, 'playout_delay_s': args.playout_delay,
-                        'half': args.half, 'checkpoint': str(args.checkpoint), 'clips': {}}, args.port
-    for source in args.sources:
-        info = probe(source)
-        fps = info[2] / frame_step(info[2])
-        print(f'{source.name}: reference', flush=True)
-        reference = reference_frames(source, args.seconds)
-        rows = []
-        for mode in args.modes:
-            out = args.out / source.stem / mode
-            print(f'{source.name}: {mode}', flush=True)
-            for attempt in range(3):  # ffmpeg occasionally crashes with 13 outputs; run again
-                client, server = run_mode(args, source, mode, out, port)
-                port += 1
-                if server.get('returncode') == 0:
-                    break
-                print(f'{source.name}: {mode}: encoder exited with {server.get("returncode")}, running again', flush=True)
-            else:
-                raise RuntimeError(f'{source.name}: {mode}: encoder kept failing')
-            gpu = gpu_stats(out / 'gpu.csv', client['resources']['unix_begin'], client['resources']['unix_end'])
-            quality = score(client, out / 'frames.raw', reference, fps, phases)
-            (out / 'quality.json').write_text(json.dumps(quality) + '\n')
-            if not args.keep_frames:
-                (out / 'frames.raw').unlink()
-            row = summarise(mode, client, server, quality, gpu, fps, phases)
-            row['decisions'] = client.get('controller', {}).get('decisions', [])
-            row['switches'] = client['summary'].get('switches', [])
-            rows.append(row)
-            print(markdown([row]).splitlines()[-1], flush=True)
-            time.sleep(3)  # let the GPU settle between runs
-        everything['clips'][source.name] = rows
-        (args.out / source.stem / 'table.md').write_text(markdown(rows))
-    (args.out / 'summary.json').write_text(json.dumps(everything, indent=1) + '\n')
-    for name, rows in everything['clips'].items():
-        print(f'\n{name}\n' + markdown(rows))
+                        'half': args.half, 'checkpoint': str(args.checkpoint), 'clips': {},
+                        'network': ({'kind': 'netem', **vars(args.path)} if args.netem else {'kind': 'emulated link'})}, args.port
+    try:
+        for source in args.sources:
+            info = probe(source)
+            fps = info[2] / frame_step(info[2])
+            print(f'{source.name}: reference', flush=True)
+            reference = reference_frames(source, args.seconds)
+            rows = []
+            for mode in args.modes:
+                out = args.out / source.stem / mode
+                print(f'{source.name}: {mode}', flush=True)
+                for attempt in range(3):  # ffmpeg occasionally crashes with 13 outputs; run again
+                    client, server = run_mode(args, source, mode, out, port)
+                    port += 1
+                    if server.get('returncode') == 0:
+                        break
+                    print(f'{source.name}: {mode}: encoder exited with {server.get("returncode")}, running again', flush=True)
+                else:
+                    raise RuntimeError(f'{source.name}: {mode}: encoder kept failing')
+                gpu = gpu_stats(out / 'gpu.csv', client['resources']['unix_begin'], client['resources']['unix_end'])
+                quality = score(client, out / 'frames.raw', reference, fps, phases)
+                (out / 'quality.json').write_text(json.dumps(quality) + '\n')
+                if not args.keep_frames:
+                    (out / 'frames.raw').unlink()
+                row = summarise(mode, client, server, quality, gpu, fps, phases)
+                row['decisions'] = client.get('controller', {}).get('decisions', [])
+                row['switches'] = client['summary'].get('switches', [])
+                rows.append(row)
+                print(markdown([row]).splitlines()[-1], flush=True)
+                time.sleep(3)  # let the GPU settle between runs
+            everything['clips'][source.name] = rows
+            (args.out / source.stem / 'table.md').write_text(markdown(rows))
+        (args.out / 'summary.json').write_text(json.dumps(everything, indent=1) + '\n')
+        for name, rows in everything['clips'].items():
+            print(f'\n{name}\n' + markdown(rows))
+    finally:
+        if args.netem:
+            NetemPath(args.path).teardown()
+        give_back(args.out)
 
 
 if __name__ == '__main__':
