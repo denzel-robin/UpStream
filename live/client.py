@@ -8,6 +8,9 @@ Threads, joined by small bounded queues:
                direct frames pass through
   main         waits until each frame is due, shows or skips it, records timings
 
+The rung is chosen by --schedule (fixed frames) or by --controller, which runs the
+trade-off controller (live/controller.py) on every packet in the receive thread.
+
 The server releases frame i at t0 + i / fps, as a camera would produce it, where
 t0 is when frame 0 was sent. Frame i is due on screen at t0 + i / fps + playout
 delay. A frame later than --drop-late is skipped on screen, but it was still
@@ -33,8 +36,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from live.controller import TradeoffController, load_table  # noqa: E402
 from live.policy import DepthPolicy  # noqa: E402
-from live.protocol import LABEL, SCALE, Channel, parse_packet  # noqa: E402
+from live.protocol import LABEL, SCALE, Channel, parse_packet, parse_rung, rung_name  # noqa: E402
 from upstream_vsr.encoding import SIZES  # noqa: E402
 from upstream_vsr.codec import MotionDecoder  # noqa: E402
 from upstream_vsr.model import UpStreamVSR, crf_to_quality  # noqa: E402
@@ -51,13 +55,12 @@ def load_model(path: Path, device: torch.device, half: bool) -> UpStreamVSR:
 
 
 def parse_schedule(text: str | None) -> list[tuple[int, str]]:
-    """'0:x4,90:x2,180:direct' -> [(0, 'x4'), (90, 'x2'), (180, 'direct')]."""
+    """'0:x4,90:x2@28,180:direct' -> [(0, 'x4'), (90, 'x2@28'), (180, 'direct')]."""
     if not text:
         return []
     items = [(int(frame), name) for frame, name in (part.split(':') for part in text.split(','))]
     for _, name in items:
-        if name not in SCALE:
-            raise ValueError(f'unknown rendition {name}')
+        parse_rung(name, 0)  # raises on an unknown rendition
     return sorted(items)
 
 
@@ -121,9 +124,11 @@ def run(args: argparse.Namespace) -> dict:
     device = torch.device(args.device)
     model = load_model(args.checkpoint, device, args.half) if args.checkpoint else None
     schedule = parse_schedule(args.schedule)
+    if schedule and args.controller:
+        raise SystemExit('use --schedule or --controller, not both')
     report = {'checkpoint': str(args.checkpoint) if args.checkpoint else None, 'half': args.half,
               'playout_delay_s': args.playout_delay, 'drop_late_s': args.drop_late,
-              'schedule': schedule, 'frames': [], 'errors': []}
+              'schedule': schedule, 'frames': [], 'errors': [], 'skipped': 0, 'guard': []}
     policy = None
     reconstruct = Reconstructor(model, device, None, args.half)
     if model is not None:
@@ -148,6 +153,15 @@ def run(args: argparse.Namespace) -> dict:
     fps = header['fps']
     if policy is not None:
         policy.frame_interval = 1 / fps
+    controller = None
+    if args.controller:
+        controller = TradeoffController(
+            load_table(args.rate_quality), header['ladder'], 1 / fps,
+            latency_budget_s=max(args.playout_delay - args.processing_margin, 0.01), policy=policy,
+            gpu_share=args.gpu_share)
+        controller.start(header['start'], time.monotonic())
+        report['controller'] = {'gpu_share': args.gpu_share, 'latency_budget_s': controller.latency_budget_s,
+                                'rate_quality': str(args.rate_quality)}
 
     packets: queue.Queue = queue.Queue(maxsize=args.queue)
     decoded: queue.Queue = queue.Queue(maxsize=args.queue)
@@ -168,6 +182,9 @@ def run(args: argparse.Namespace) -> dict:
                 downstream.put(END)
         return threading.Thread(target=wrapper, name=name, daemon=True)
 
+    received = [0]
+    reported = [1e-9]  # capacity last sent to the server
+
     def receive():
         while True:
             record = channel.receive()
@@ -176,24 +193,46 @@ def run(args: argparse.Namespace) -> dict:
             kind, payload = record
             if kind == b'E':
                 report['end'] = json.loads(payload)
+                # Includes frames dropped at the very end, which no later keyframe reveals.
+                report['skipped'] = report['end']['frames'] - received[0]
                 return
+            if kind == b'R':
+                if controller is not None:
+                    controller.observe_rates(json.loads(payload))
+                continue
+            if kind == b'G':
+                guard = json.loads(payload)
+                report['guard'].append(guard)  # the server dropped frames to keep its backlog short
+                continue
             if kind != b'P':
                 raise ValueError(f'unexpected record {kind!r}')
             packet = parse_packet(payload)
             arrived = time.monotonic()
+            received[0] += 1
             if not anchor:
                 anchor.append(packet.sent)
+            if controller is not None:
+                controller.observe_packet(packet.sent, arrived, len(packet.data), packet.keyframe)
+                if (decision := controller.decide(arrived)) is not None:
+                    channel.send_json(b'S', {'rung': decision[0], 'skip': decision[2]})
+                if controller.capacity and abs(controller.capacity - reported[0]) > 0.1 * reported[0]:
+                    reported[0] = controller.capacity
+                    # The server's guard drops only frames that would arrive too late to be shown.
+                    channel.send_json(b'C', {'kbps': round(controller.capacity, 1), 'budget_ms': round(
+                        (args.playout_delay + args.drop_late - args.processing_margin) * 1000, 1)})
             packets.put((packet, arrived))
 
     def decode():
-        decoder, rendition, previous = None, None, None
+        decoder, rung, previous = None, None, None
         while (entry := packets.get()) is not END:
             packet, arrived = entry
-            if packet.rendition != rendition:
+            if (packet.rendition, packet.crf) != rung:
                 if not packet.keyframe:
                     raise RuntimeError(f'switch to {packet.rendition} at frame {packet.index} is not on a keyframe')
-                decoder, rendition = MotionDecoder(), packet.rendition
-            if previous is not None and packet.index != previous + 1:
+                decoder, rung = MotionDecoder(), (packet.rendition, packet.crf)
+            # A gap is allowed only up to a keyframe: the server dropped the rest of a
+            # group to drain the queue, and the keyframe starts a clean one.
+            if previous is not None and packet.index != previous + 1 and not packet.keyframe:
                 raise RuntimeError(f'frame {previous + 1} missing')
             previous = packet.index
             begin = time.perf_counter()
@@ -207,7 +246,7 @@ def run(args: argparse.Namespace) -> dict:
         steps = list(schedule)
         while (item := decoded.get()) is not END:
             while steps and steps[0][0] <= item['index']:
-                channel.send_json(b'S', {'rendition': steps.pop(0)[1]})
+                channel.send_json(b'S', {'rung': steps.pop(0)[1]})
             started = time.monotonic()
             frame, info = reconstruct(item, due(item['index']) - started)
             item.update(info, started=started, reconstructed=time.monotonic(), output=frame)
@@ -254,7 +293,11 @@ def run(args: argparse.Namespace) -> dict:
             import cv2
             cv2.destroyAllWindows()
     report['bytes_received'] = channel.bytes_received
+    if controller is not None:
+        report['controller']['decisions'] = controller.trace
     report['summary'] = summarise(report['frames'], fps)
+    if report['summary']:
+        report['summary']['skipped'] = report['skipped']
     return report
 
 
@@ -286,9 +329,14 @@ def summarise(frames: list[dict], fps: float) -> dict:
             entry['exits'] = {str(e): sum(f['exit'] == e for f in chosen) for e in sorted({f['exit'] for f in chosen})}
         by_rendition[name] = entry
     summary['by_rendition'] = by_rendition
-    renditions = [f['rendition'] for f in frames]
-    summary['switches'] = [{'frame': frames[i]['index'], 'to': renditions[i]}
-                           for i in range(1, len(frames)) if renditions[i] != renditions[i - 1]]
+    rungs = [rung_name(f['rendition'], f['crf']) for f in frames]
+    summary['by_rung'] = {name: {'frames': rungs.count(name),
+                                 'kbps': round(sum(f['bytes'] for f, r in zip(frames, rungs) if r == name)
+                                               * 8 * fps / rungs.count(name) / 1000, 1)}
+                          for name in dict.fromkeys(rungs)}
+    summary['switches'] = [{'frame': frames[i]['index'], 'to': rungs[i]}
+                           for i in range(1, len(frames)) if rungs[i] != rungs[i - 1]]
+    summary['kbps'] = round(sum(f['bytes'] for f in frames) * 8 * fps / len(frames) / 1000, 1)
     return summary
 
 
@@ -297,7 +345,13 @@ def main() -> None:
     parser.add_argument('--checkpoint', type=Path, help='UpStreamVSR checkpoint; without it x2/x4 frames are shown as received')
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8766)
-    parser.add_argument('--schedule', help='switch requests by frame, for example 0:x4,90:x2,180:direct')
+    parser.add_argument('--schedule', help='switch requests by frame, for example 0:x4,90:x2@28,180:direct')
+    parser.add_argument('--controller', action='store_true', help='choose rungs with the trade-off controller')
+    parser.add_argument('--rate-quality', type=Path, default=Path(__file__).resolve().parent.parent / 'configs/rate_quality.json',
+                        help='table from scripts/measure_rate_quality.py, for --controller')
+    parser.add_argument('--gpu-share', type=float, default=0.6, help='share of the frame interval the model may use')
+    parser.add_argument('--processing-margin', type=float, default=0.025,
+                        help='seconds of the playout delay kept for decoding and reconstruction')
     parser.add_argument('--playout-delay', type=float, default=0.1, help='seconds of buffer after frame 0 arrives')
     parser.add_argument('--drop-late', type=float, default=0.05, help='skip showing a frame this much past due')
     parser.add_argument('--queue', type=int, default=8, help='frames each stage may buffer')

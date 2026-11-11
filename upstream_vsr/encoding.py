@@ -35,6 +35,22 @@ def filter_graph(fps: float) -> str:
             f'[a]scale=640:360{_RESCALE}[lr2];[b]scale=320:180{_RESCALE}[lr4]')
 
 
+def ladder_graph(fps: float, copies: dict[str, int]) -> str:
+    """filter_graph with each output split into copies, labelled [gt_0], [gt_1], [lr2_0], ...
+
+    Every copy of a rendition must be encoded inside this one graph. Re-encoding the
+    lossless reference later in a separate ffmpeg loses its colour matrix and shifts
+    the colours by about 5 levels, the same fault as in the Kaggle data.
+    A label with 0 copies is discarded.
+    """
+    graph = filter_graph(fps)
+    for label in ('gt', 'lr2', 'lr4'):
+        count = copies.get(label, 0)
+        graph += f';[{label}]' + (f'split={count}' + ''.join(f'[{label}_{i}]' for i in range(count))
+                                   if count else 'nullsink')
+    return graph
+
+
 def x264_live() -> list[str]:
     """X264 plus SPS/PPS before every keyframe, so a client can join or switch there.
 

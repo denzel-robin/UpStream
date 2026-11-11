@@ -48,8 +48,8 @@ fits before the frame is due, capped at one frame interval. Expected times start
 the median of a warm-up run before connecting and then follow the measured times. A
 frame that is skipped on screen is still reconstructed, so the state has no gaps.
 
-`--schedule 0:x4,90:x2,180:direct` sends switch requests at fixed frames; the
-trade-off controller (milestone 4) will replace it. `--half` runs the model in float16.
+`--schedule 0:x4,90:x2,180:direct` sends switch requests at fixed frames;
+`--controller` lets the trade-off controller choose instead (docs/CONTROLLER.md). `--half` runs the model in float16.
 
 ## First measurements (2026-11-10)
 
@@ -85,8 +85,7 @@ milestone 5.
 - Encoding latency is not in the figures above.
 - The threads share Python's interpreter lock; decoding and the model mostly run in C
   and CUDA, but heavy load could add jitter.
-- No network shaping yet (milestone 5), and the stream has one CRF; bitrate switching is
-  milestone 4.
+- No real network shaping yet (milestone 5); `--link` emulates a bottleneck.
 
 ## Running it
 

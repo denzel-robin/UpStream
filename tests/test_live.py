@@ -53,7 +53,7 @@ def test_policy_follows_measurements():
 
 
 def test_schedule_parsing():
-    assert parse_schedule('90:x2,0:x4,180:direct') == [(0, 'x4'), (90, 'x2'), (180, 'direct')]
+    assert parse_schedule('90:x2,0:x4@28,180:direct') == [(0, 'x4@28'), (90, 'x2'), (180, 'direct')]
     with pytest.raises(ValueError):
         parse_schedule('0:x3')
 
@@ -116,6 +116,44 @@ def test_live_stream_switches_on_keyframes():
         served = json.loads((temp / 'server.json').read_text())
         played = json.loads((temp / 'client.json').read_text())
     assert served['frames'] == 90 and played['summary']['frames'] == 90
-    assert served['switches'] == [{'frame': 30, 'from': 'x4', 'to': 'x2'}, {'frame': 60, 'from': 'x2', 'to': 'direct'}]
+    assert served['switches'] == [{'frame': 30, 'from': 'x4@23', 'to': 'x2@23'},
+                                  {'frame': 60, 'from': 'x2@23', 'to': 'direct@23'}]
     assert [f['rendition'] for f in played['frames']] == ['x4'] * 30 + ['x2'] * 30 + ['direct'] * 30
     assert played['summary']['dropped'] == 0
+
+
+@needs_ffmpeg
+def test_controller_drives_the_live_stream_through_a_link_drop():
+    """Controller and emulated link end to end, without a model: switches and skips land on keyframes."""
+    with tempfile.TemporaryDirectory() as temp:
+        temp = Path(temp)
+        source = temp / 'source.mp4'
+        subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=1280x720:r=30', '-t', '8',
+                        '-c:v', 'libx264', '-crf', '18', '-pix_fmt', 'yuv420p', str(source)], check=True)
+        table = {f'{r}@{c}': {'kbps': 100.0, 'psnr': [40.0 - c / 2] * (1 if r == 'direct' else 3)}
+                 for r in ('direct', 'x2', 'x4') for c in (23, 43)}
+        (temp / 'table.json').write_text(json.dumps({'rungs': table}))
+        port = free_port()
+        server = subprocess.Popen([sys.executable, str(ROOT / 'live/server.py'), str(source), '--port', str(port),
+                                   '--start', 'direct@43', '--crfs', '23', '43', '--direct-crfs', '23', '43',
+                                   '--link', '0:20000,4:300', '--report', str(temp / 'server.json')],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            assert server.stdout.readline().startswith('READY')
+            client = subprocess.run([sys.executable, str(ROOT / 'live/client.py'), '--port', str(port), '--device', 'cpu',
+                                     '--controller', '--rate-quality', str(temp / 'table.json'),
+                                     '--playout-delay', '0.2', '--report', str(temp / 'client.json')],
+                                    capture_output=True, text=True, timeout=90)
+            assert client.returncode == 0, client.stdout + client.stderr
+            server.wait(timeout=60)
+        finally:
+            if server.poll() is None:
+                server.kill()
+        served = json.loads((temp / 'server.json').read_text())
+        played = json.loads((temp / 'client.json').read_text())
+    decisions = played['controller']['decisions']
+    assert decisions and decisions[0]['to'] == 'direct@23'  # a fast link: the best direct rung
+    assert all(s['frame'] % 30 == 0 for s in served['switches'])
+    assert played['summary']['frames'] + played['skipped'] == served['frames'] == 240
+    assert played['skipped'] == served['skipped']
+    assert played['summary']['by_rung'].get('direct@43', {}).get('frames', 0) > 0  # back down after the drop
