@@ -57,15 +57,20 @@ MODES = {
 PYTHON = sys.executable
 
 
-def reference_frames(source: Path, seconds: float) -> list[np.ndarray]:
-    """The 720p reference the server's graph makes, decoded as the client decodes."""
+def make_reference(source: Path, seconds: float, folder: Path) -> Path:
+    """The 720p reference the server's graph makes, losslessly, for scoring."""
     info = probe(source)
-    with tempfile.TemporaryDirectory() as temp:
-        path = Path(temp) / 'reference.nut'
-        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-t', str(seconds), '-i', str(source),
-                        '-filter_complex', ladder_graph(info[2], {'gt': 1}), '-map', '[gt_0]',
-                        '-c:v', 'ffv1', '-colorspace', 'bt709', '-color_range', 'tv', str(path)], check=True)
-        return [frame.rgb for frame in decode_with_motion(path)]
+    path = folder / 'reference.nut'
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-t', str(seconds), '-i', str(source),
+                    '-filter_complex', ladder_graph(info[2], {'gt': 1}), '-map', '[gt_0]',
+                    '-c:v', 'ffv1', '-colorspace', 'bt709', '-color_range', 'tv', str(path)], check=True)
+    return path
+
+
+def reference_frames(path: Path):
+    """Reference frames decoded as the client decodes them, one at a time (a 5-minute
+    run would not fit in memory as a list)."""
+    return (frame.rgb for frame in decode_with_motion(path))
 
 
 def psnr(a: np.ndarray, b: np.ndarray) -> float:
@@ -73,21 +78,21 @@ def psnr(a: np.ndarray, b: np.ndarray) -> float:
     return float(10 * np.log10(255 ** 2 / max(error, 1e-10)))
 
 
-def score(client: dict, record: Path, reference: list[np.ndarray], fps: float, phases: list[tuple[float, float]]) -> dict:
+def score(client: dict, record: Path, reference, fps: float, phases: list[tuple[float, float]]) -> dict:
     """What the viewer saw, slot by slot, against the reference."""
     shape = tuple(client['record']['shape'])
     frames = np.memmap(record, dtype=np.uint8, mode='r', shape=(client['record']['frames'], *shape))
     shown = {f['index']: f['recorded'] for f in client['frames'] if not f['dropped'] and 'recorded' in f}
     total = client['end']['frames']
     per_slot, held, current, fresh = [], [], None, []
-    for i in range(min(total, len(reference))):
+    for i, target in zip(range(total), reference):
         if i in shown:
             current = shown[i]
         fresh.append(i in shown)
         if current is None:  # nothing on screen yet
             per_slot.append(None)
             continue
-        per_slot.append(psnr(frames[current], reference[i]))
+        per_slot.append(psnr(frames[current], target))
     valid = [v for v in per_slot if v is not None]
     freezes, run = [], 0
     for is_fresh in fresh:
@@ -304,7 +309,8 @@ def main() -> None:
             info = probe(source)
             fps = info[2] / frame_step(info[2])
             print(f'{source.name}: reference', flush=True)
-            reference = reference_frames(source, args.seconds)
+            work = tempfile.TemporaryDirectory()
+            reference_path = make_reference(source, args.seconds, Path(work.name))
             rows = []
             for mode in args.modes:
                 out = args.out / source.stem / mode
@@ -318,7 +324,7 @@ def main() -> None:
                 else:
                     raise RuntimeError(f'{source.name}: {mode}: encoder kept failing')
                 gpu = gpu_stats(out / 'gpu.csv', client['resources']['unix_begin'], client['resources']['unix_end'])
-                quality = score(client, out / 'frames.raw', reference, fps, phases)
+                quality = score(client, out / 'frames.raw', reference_frames(reference_path), fps, phases)
                 (out / 'quality.json').write_text(json.dumps(quality) + '\n')
                 if not args.keep_frames:
                     (out / 'frames.raw').unlink()
@@ -329,6 +335,7 @@ def main() -> None:
                 print(markdown([row]).splitlines()[-1], flush=True)
                 time.sleep(3)  # let the GPU settle between runs
             everything['clips'][source.name] = rows
+            work.cleanup()
             (args.out / source.stem / 'table.md').write_text(markdown(rows))
         (args.out / 'summary.json').write_text(json.dumps(everything, indent=1) + '\n')
         for name, rows in everything['clips'].items():

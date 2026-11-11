@@ -248,3 +248,56 @@ updating it.
 sudo bash scripts/run_netem.sh smoke   # 8 s check
 sudo bash scripts/run_netem.sh full    # both profiles, about 25 minutes
 ```
+
+## Five-minute sustained run (2026-11-11)
+
+The success criterion: 5 minutes at 30 fps with no collapse. The earlier NanoVSR study
+failed it, dropping to 20.87 fps and stopping at 80 s.
+
+Source: ten test clips, 30 s each, joined at 30 fps and 720p
+(`scripts/make_sustained_source.sh`; 9,000 frames). The emulated link changed every
+30 s: 2500, 1500, 500, 1000, 3000, 700, 2000, 400, 1200, 2500 kbit/s. Two modes ran:
+adaptive (the full system) and x4 only (the heaviest GPU load). FP16, RTX 3050 Laptop.
+
+| | adaptive | x4 only |
+|---|---:|---:|
+| Frames released by the server on time | 9000 / 9000 | 9000 / 9000 |
+| Encoder late releases | 0 | 0 |
+| Frames shown / late / skipped | 8504 / 124 / 372 | 8852 / 34 / 114 |
+| Display latency p50 / p95 / max, ms | 155 / 160 / 948 | 155 / 157 / 354 |
+| Viewer / shown PSNR, dB | **30.87** / **31.73** | 29.16 / 29.37 |
+| Mean payload, kbit/s | 638 | 492 |
+| Model GPU time, % of wall time | 17.4 | 28.8 |
+| GPU power, W (mean) | 20.7 | 25.3 |
+| GPU temperature, °C | 59–63 | 60–65 |
+| Peak model memory, MiB | 93.6 | 93.6 |
+| Client CPU, % of one core | 58 | 60 |
+| Rendition share (adaptive) | direct 20%, x2 54%, x4 22%, skipped 4% | |
+
+Per 30-second window (each window is a different clip, so PSNR changes with content as
+well as with the link):
+
+| From | Link, kbit/s | Adaptive: shown / late / skipped | Latency p50 / p95, ms | Model ms | GPU °C | Adaptive used |
+|---:|---:|---|---|---:|---:|---|
+| 0 s | 2500 | 840 / 16 / 44 | 155 / 159 | 6.9 | 60 | x2 510, direct 316, x4 30 |
+| 30 s | 1500 | 800 / 5 / 95 | 155 / 161 | 6.8 | 59 | x2 640, direct 165 |
+| 60 s | 500 | 867 / 5 / 28 | 155 / 158 | 7.9 | 60 | x2 430, x4 352, direct 90 |
+| 90 s | 1000 | 830 / 3 / 67 | 155 / 158 | 7.9 | 61 | x2 473, x4 360 |
+| 120 s | 3000 | 871 / 6 / 23 | 155 / 156 | 6.6 | 60 | direct 817, x2 60 |
+| 150 s | 700 | 839 / 21 / 40 | 156 / 159 | 8.0 | 61 | x2 523, x4 330 |
+| 180 s | 2000 | 864 / 7 / 29 | 156 / 159 | 7.0 | 61 | x2 811, direct 60 |
+| 210 s | 400 | 826 / 56 / 18 | 155 / 157 | 9.7 | 63 | x4 861, x2 21 |
+| 240 s | 1200 | 869 / 3 / 28 | 155 / 160 | 6.9 | 62 | x2 752, direct 90 |
+| 270 s | 2500 | 898 / 2 / 0 | 155 / 159 | 6.6 | 62 | x2 660, direct 240 |
+
+**Passed.**
+- The pipeline kept 30 fps for the whole 5 minutes in both modes: every frame was
+  released on time, and late and skipped frames come from the link, not from the
+  pipeline falling behind.
+- Latency did not drift: the median stayed at 155 ms (the 150 ms playout delay plus
+  transport) in every window.
+- Model time, memory (93.6 MiB) and temperature (at most 65 °C) stayed flat.
+- The last window, back at 2500 kbit/s, showed 898 of 900 frames.
+
+x4 only is the steadier stream (fewer skips, lower worst-case latency) but scores
+1.7 dB lower and uses 65% more GPU time.
