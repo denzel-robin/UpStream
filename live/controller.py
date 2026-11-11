@@ -80,6 +80,8 @@ class DeliveryMonitor:
         self.fit: tuple[float, float] | None = None  # (fixed delay s, capacity kbit/s)
         self.fit_at = float('-inf')
         self.latest = float('-inf')
+        self.last_key: tuple[float, int] | None = None  # (sent, bytes) of the latest keyframe
+        self.excess = 0.0  # queuing delay of the latest packet beyond its keyframe's burst
 
     def add(self, sent: float, arrived: float, size: int, keyframe: bool = False) -> None:
         delay = arrived - sent
@@ -98,8 +100,17 @@ class DeliveryMonitor:
         self.previous_arrival = arrived
         fixed, capacity = self.fit if self.fit else (self.min_delay, None)
         own = size * 8 / (capacity * 1000) if capacity else 0.0
+        queued = max(delay - fixed - own, 0.0)
+        if keyframe:
+            self.last_key = (sent, size)
+        # A packet sent while its keyframe is still crossing the link waits for the rest
+        # of it; only the delay beyond that means the link is slower than estimated.
+        burst = 0.0
+        if capacity and self.last_key and not keyframe:
+            burst = max(self.last_key[1] * 8 / (capacity * 1000) - (sent - self.last_key[0]), 0.0)
+        self.excess = max(queued - burst, 0.0)
         self.arrivals.append((arrived, size))
-        self.queueing.append((arrived, max(delay - fixed - own, 0.0)))
+        self.queueing.append((arrived, queued))
         while self.arrivals and self.arrivals[0][0] < arrived - self.window_s:
             self.arrivals.popleft()
         while self.queueing and self.queueing[0][0] < arrived - self.standing_s:
@@ -172,13 +183,16 @@ class TradeoffController:
                  congestion_s: float = 0.04,
                  probe_s: float = 4.0, min_gain_db: float = 0.1, keyint: int = 30, rate_memory: int = 3,
                  up_hold_s: float = 2.0,
-                 tie_db: float = 0.05) -> None:
+                 tie_db: float = 0.05, deadline_s: float | None = None) -> None:
         missing = [name for name in ladder if name not in table]
         if missing:
             raise ValueError(f'rate-quality table has no entry for {missing}')
         self.table, self.policy = table, policy
         self.rungs = {name: Rung(*parse_rung(name)) for name in ladder}
         self.frame_interval, self.latency_budget_s = frame_interval, latency_budget_s
+        # The display deadline (playout delay plus drop-late less processing): a packet
+        # may wait up to it and still be shown, as the P-frames behind a keyframe do.
+        self.deadline_s = latency_budget_s if deadline_s is None else max(deadline_s, latency_budget_s)
         self.gpu_share, self.headroom, self.stay_headroom = gpu_share, headroom, stay_headroom
         self.congestion_s = congestion_s
         self.probe_s = probe_s
@@ -234,10 +248,11 @@ class TradeoffController:
         return None if exit_index is None else entry['psnr'][exit_index]
 
     def burst_fits(self, name: str) -> bool:
-        """A keyframe of this rung crosses the link inside the latency budget."""
+        """A keyframe of this rung crosses the link before the display deadline, so it
+        and the frames queued behind it are still shown."""
         if self.capacity is None or name not in self.key_bytes:
             return True
-        return self.key_bytes[name] * 8 / (self.capacity * 1000) <= self.latency_budget_s
+        return self.key_bytes[name] * 8 / (self.capacity * 1000) <= self.deadline_s
 
     # Decision -----------------------------------------------------------
 
@@ -268,7 +283,12 @@ class TradeoffController:
             cheapest = min(runnable, key=self.rate)
             options = {cheapest: runnable[cheapest]}
 
-        draining = self.monitor.queue_delay > self.latency_budget_s
+        # Drain for a queue that persists past the budget, or for one that the last
+        # keyframe does not explain. The short queue behind a keyframe clears by itself,
+        # and skipping to the next keyframe would only repeat it; rungs whose keyframes
+        # are too large for the link are excluded by burst_fits instead.
+        draining = (self.monitor.standing_queue > self.latency_budget_s
+                    or self.monitor.excess > self.latency_budget_s)
         if draining:
             measured = self.capacity or self.monitor.delivery_kbps or self.rate(self.current)
             allowed, reason = 0.5 * measured, 'drain'

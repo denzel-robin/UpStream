@@ -40,7 +40,7 @@ Complete a live video upscaling pipeline that balances four things:
 | 2 | Prepare the full StreamSR data and train on Kaggle | Third design trained at 32 channels: +0.82 dB over bicubic at x2, +1.15 at x4 on the test set (docs/MODEL.md). Earlier results were invalid because of a colour error in the Kaggle data, now fixed. 48-channel run after the quota reset |
 | 3 | Live integration: motion vectors from the decoder, per-frame depth, separate reconstruction and display threads | Done for one machine (docs/LIVE.md): frames ready 12 to 13 ms after release, no drops, switches on keyframes; rerun with the trained third design: ready 12 to 13.5 ms after release |
 | 4 | Trade-off controller with mid-stream resolution and bitrate switching | Done (docs/CONTROLLER.md): 13-rung ladder, capacity from keyframes, backlog guard, GPU-aware. BD-rate against direct: x4 -31%, x2 -4%. Upscaling wins below about 1 Mbit/s |
-| 5 | Evaluation with shaped network conditions, ablation of each technique, sustained run | Not started |
+| 5 | Evaluation with shaped network conditions, ablation of each technique, sustained run | Started: end-to-end comparison of direct, x2, x4 and adaptive with measured quality (docs/COMPARISON.md). Adaptive is best on 2 of 3 clips and never more than 1 dB from the best mode. tc netem, ablation and sustained run still to do |
 | 6 | Report (must explain how the four-way trade-off works and how and why the pipeline switches between direct, x2 and x4, with measured results) and final demo | Not started |
 
 ## Success criteria

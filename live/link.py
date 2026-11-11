@@ -27,7 +27,8 @@ class EmulatedLink:
         self.records: queue.Queue = queue.Queue()
         self.start = time.monotonic()
         self.max_delay_s = 0.0
-        self.queued_bytes = 0  # handed to the link, not yet delivered
+        self._queued = 0  # handed to the link, not yet delivered, whole records
+        self._sending: tuple[float, float, int] | None = None  # (begin, done, bytes) of the record on the wire
         self.error: BaseException | None = None
         self.thread = threading.Thread(target=self._run, name='link', daemon=True)
         self.thread.start()
@@ -39,6 +40,17 @@ class EmulatedLink:
                 rate = kbps
         return rate
 
+    @property
+    def queued_bytes(self) -> int:
+        """Bytes not yet delivered, counting only what is left of the record on the wire,
+        as a socket's send queue would: a keyframe drains gradually, not all at once."""
+        sending, queued = self._sending, self._queued
+        if sending is None:
+            return queued
+        begin, done, size = sending
+        left = size * min(max((done - time.monotonic()) / max(done - begin, 1e-9), 0.0), 1.0)
+        return max(int(queued - size + left), 0)
+
     def start_clock(self) -> None:
         """Time the rate schedule from now (the server calls it when frame 0 leaves)."""
         self.start = time.monotonic()
@@ -46,7 +58,7 @@ class EmulatedLink:
     def send(self, record: bytes) -> None:
         if self.error is not None:
             raise ConnectionError('link failed') from self.error
-        self.queued_bytes += len(record)
+        self._queued += len(record)
         self.records.put((time.monotonic(), record))
 
     def close(self, timeout: float = 60) -> None:
@@ -61,10 +73,12 @@ class EmulatedLink:
                 queued, record = item
                 begin = max(time.monotonic(), free_at)
                 done = begin + len(record) * 8 / (self.rate_kbps(begin) * 1000)
+                self._sending = (begin, done, len(record))
                 if (wait := done - time.monotonic()) > 0:
                     time.sleep(wait)
                 self.sock.sendall(record)
-                self.queued_bytes -= len(record)
+                self._sending = None
+                self._queued -= len(record)
                 free_at = done
                 self.max_delay_s = max(self.max_delay_s, time.monotonic() - queued)
         except BaseException as error:  # reported by the next send

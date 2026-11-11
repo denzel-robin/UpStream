@@ -120,6 +120,39 @@ class Reconstructor:
         return frame, {'exit': exit_index, 'model_s': seconds}
 
 
+class Recorder:
+    """Writes every reconstructed frame, raw RGB, in a thread so display is not held up.
+
+    Dropped frames are recorded too; the report says which frames were shown, so a
+    scorer can rebuild what the viewer saw.
+    """
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.file, self.count, self.shape = open(path, 'wb'), 0, None
+        self.queue: queue.Queue = queue.Queue()
+        self.thread = threading.Thread(target=self.write, name='record', daemon=True)
+        self.thread.start()
+
+    def add(self, frame: np.ndarray) -> int:
+        if self.shape is None:
+            self.shape = list(frame.shape)
+        elif list(frame.shape) != self.shape:
+            raise ValueError(f'frame shape {frame.shape} differs from {self.shape}')
+        self.queue.put(np.ascontiguousarray(frame))
+        self.count += 1
+        return self.count - 1
+
+    def write(self) -> None:
+        while (frame := self.queue.get()) is not None:
+            self.file.write(frame.tobytes())
+
+    def close(self) -> None:
+        self.queue.put(None)
+        self.thread.join()
+        self.file.close()
+
+
 def run(args: argparse.Namespace) -> dict:
     device = torch.device(args.device)
     model = load_model(args.checkpoint, device, args.half) if args.checkpoint else None
@@ -155,13 +188,17 @@ def run(args: argparse.Namespace) -> dict:
         policy.frame_interval = 1 / fps
     controller = None
     if args.controller:
+        # --renditions limits the choice, for comparing one rendition against the full ladder.
+        ladder = [name for name in header['ladder'] if parse_rung(name, 0)[0] in args.renditions]
+        if header['start'] not in ladder:
+            raise SystemExit(f"the server starts on {header['start']}, outside --renditions {args.renditions}")
         controller = TradeoffController(
-            load_table(args.rate_quality), header['ladder'], 1 / fps,
+            load_table(args.rate_quality), ladder, 1 / fps,
             latency_budget_s=max(args.playout_delay - args.processing_margin, 0.01), policy=policy,
-            gpu_share=args.gpu_share)
+            gpu_share=args.gpu_share, deadline_s=args.playout_delay + args.drop_late - args.processing_margin)
         controller.start(header['start'], time.monotonic())
         report['controller'] = {'gpu_share': args.gpu_share, 'latency_budget_s': controller.latency_budget_s,
-                                'rate_quality': str(args.rate_quality)}
+                                'rate_quality': str(args.rate_quality), 'ladder': ladder}
 
     packets: queue.Queue = queue.Queue(maxsize=args.queue)
     decoded: queue.Queue = queue.Queue(maxsize=args.queue)
@@ -254,6 +291,10 @@ def run(args: argparse.Namespace) -> dict:
             shown.put(item)
 
     threads = [guarded('receive', receive), guarded('decode', decode), guarded('reconstruct', reconstruct_loop)]
+    recorder = Recorder(args.record) if args.record else None
+    cpu_begin, wall_begin, unix_begin = time.process_time(), time.monotonic(), time.time()
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
     for thread in threads:
         thread.start()
 
@@ -275,7 +316,9 @@ def run(args: argparse.Namespace) -> dict:
                 cv2.imshow(window, cv2.cvtColor(item.pop('output'), cv2.COLOR_RGB2BGR))
                 if cv2.waitKey(1) & 255 == 27:
                     raise KeyboardInterrupt('closed with Escape')
-            item.pop('output', None)
+            output = item.pop('output', None)
+            if recorder is not None and output is not None:
+                item['recorded'] = recorder.add(output)
             displayed = time.monotonic()
             item.update(dropped=dropped, displayed=displayed, late_s=late,
                         latency_s=displayed - (anchor[0] + item['index'] / fps),
@@ -292,6 +335,15 @@ def run(args: argparse.Namespace) -> dict:
         if window:
             import cv2
             cv2.destroyAllWindows()
+        if recorder is not None:
+            recorder.close()
+    report['resources'] = {
+        'client_cpu_s': round(time.process_time() - cpu_begin, 3), 'wall_s': round(time.monotonic() - wall_begin, 3),
+        'unix_begin': unix_begin, 'unix_end': time.time(),
+        'peak_gpu_mib': round(torch.cuda.max_memory_allocated(device) / 2 ** 20, 1) if device.type == 'cuda' else None,
+        'model_gpu_s': round(sum(f.get('model_s', 0.0) for f in report['frames']), 3)}
+    if recorder is not None:
+        report['record'] = {'path': str(args.record), 'frames': recorder.count, 'shape': recorder.shape}
     report['bytes_received'] = channel.bytes_received
     if controller is not None:
         report['controller']['decisions'] = controller.trace
@@ -349,6 +401,9 @@ def main() -> None:
     parser.add_argument('--controller', action='store_true', help='choose rungs with the trade-off controller')
     parser.add_argument('--rate-quality', type=Path, default=Path(__file__).resolve().parent.parent / 'configs/rate_quality.json',
                         help='table from scripts/measure_rate_quality.py, for --controller')
+    parser.add_argument('--renditions', nargs='+', default=['direct', 'x2', 'x4'], choices=['direct', 'x2', 'x4'],
+                        help='renditions the controller may choose, for example x4 alone')
+    parser.add_argument('--record', type=Path, help='write every reconstructed frame here, raw RGB, for scoring')
     parser.add_argument('--gpu-share', type=float, default=0.6, help='share of the frame interval the model may use')
     parser.add_argument('--processing-margin', type=float, default=0.025,
                         help='seconds of the playout delay kept for decoding and reconstruction')

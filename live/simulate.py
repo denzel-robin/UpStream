@@ -39,10 +39,11 @@ def at(schedule: list[tuple[float, float]], t: float) -> float:
 
 def simulate(table: dict, ladder: list[str], link: list[tuple[float, float]], seconds: float, start: str,
              fps: float = 30.0, playout_delay: float = 0.15, gpu_load: list[tuple[float, float]] | None = None,
-             gpu_share: float = 0.6, key_ratio: float = 4.0, use_model: bool = True) -> dict:
+             gpu_share: float = 0.6, key_ratio: float = 4.0, use_model: bool = True, drop_late: float = 0.05) -> dict:
     policy = DepthPolicy(3, 1 / fps) if use_model else None
     controller = TradeoffController(table, ladder, 1 / fps, latency_budget_s=playout_delay - 0.025,
-                                    policy=policy, gpu_share=gpu_share)
+                                    policy=policy, gpu_share=gpu_share,
+                                    deadline_s=playout_delay + drop_late - 0.025)
     controller.start(start, 0.0)
 
     def sizes(name: str) -> tuple[int, int]:
@@ -88,7 +89,7 @@ def simulate(table: dict, ladder: list[str], link: list[tuple[float, float]], se
         pending.append({'index': i, 'rung': current, 'sent': now, 'arrived': free_at, 'bytes': size,
                         'keyframe': keyframe, 'link_kbps': rate})
 
-    late = [f for f in frames if f['arrived'] - f['sent'] > playout_delay - 0.025]
+    late = [f for f in frames if f['arrived'] - f['sent'] > playout_delay + drop_late - 0.025]
     quality = []
     for f in frames:
         set_gpu(f['sent'])

@@ -116,7 +116,8 @@ def test_live_stream_switches_on_keyframes():
         served = json.loads((temp / 'server.json').read_text())
         played = json.loads((temp / 'client.json').read_text())
     assert served['frames'] == 90 and played['summary']['frames'] == 90
-    assert served['switches'] == [{'frame': 30, 'from': 'x4@23', 'to': 'x2@23'},
+    assert [{k: v for k, v in s.items() if k != 'at'} for s in served['switches']] == [
+                                  {'frame': 30, 'from': 'x4@23', 'to': 'x2@23'},
                                   {'frame': 60, 'from': 'x2@23', 'to': 'direct@23'}]
     assert [f['rendition'] for f in played['frames']] == ['x4'] * 30 + ['x2'] * 30 + ['direct'] * 30
     assert played['summary']['dropped'] == 0

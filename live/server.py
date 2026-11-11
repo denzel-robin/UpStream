@@ -55,15 +55,18 @@ def build_ladder(crfs: list[int], direct_crfs: list[int]) -> list[tuple[str, int
     return ([('direct', crf) for crf in direct_crfs] + [('x2', crf) for crf in crfs] + [('x4', crf) for crf in crfs])
 
 
-def start_encoder(source: Path, fps: float, ladder: list[tuple[str, int]],
+def start_encoder(source: Path, source_fps: float, ladder: list[tuple[str, int]],
                   seconds: float | None) -> tuple[subprocess.Popen, dict[str, int]]:
-    """Start ffmpeg; returns the process and a readable pipe per rung."""
+    """Start ffmpeg; returns the process and a readable pipe per rung.
+
+    source_fps is the source's own rate: the graph halves 45+ fps sources itself.
+    """
     pipes = {rung_name(*rung): os.pipe() for rung in ladder}
     copies = {label: sum(LABEL[rendition] == label for rendition, _ in ladder) for label in LABEL.values()}
     command = ['ffmpeg', '-v', 'error', '-nostdin', '-re', '-readrate_initial_burst', '0']
     if seconds:
         command += ['-t', str(seconds)]
-    command += ['-i', str(source), '-filter_complex', ladder_graph(fps, copies)]
+    command += ['-i', str(source), '-filter_complex', ladder_graph(source_fps, copies)]
     used = dict.fromkeys(LABEL.values(), 0)
     for rendition, crf in ladder:
         label = LABEL[rendition]
@@ -118,7 +121,7 @@ def serve(args: argparse.Namespace) -> dict:
     report = {'source': str(args.source), 'fps': fps, 'crf': args.crf, 'ladder': names, 'start': start,
               'link': link_schedule, 'switches': [], 'frames_by_rung': {}, 'bytes_by_rung': {},
               'late_releases': 0, 'max_release_lag_s': 0.0, 'skipped': 0, 'backlog_skips': 0,
-              'max_backlog_ms': args.max_backlog_ms}
+              'max_backlog_ms': args.max_backlog_ms, 'requests': [], 'max_encoder_lead_s': 0.0}
 
     with socket.socket() as listener:
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -133,7 +136,7 @@ def serve(args: argparse.Namespace) -> dict:
         channel = Channel(conn, link)
         client_kbps = [None]  # the client's capacity estimate (C records), for the backlog guard
         limit_ms = [args.max_backlog_ms]  # replaced by the client's latency budget when it sends one
-        process, pipes = start_encoder(args.source, fps, ladder, args.seconds)
+        process, pipes = start_encoder(args.source, info[2], ladder, args.seconds)
         channel.send_json(b'H', {'fps': fps, 'crf': args.crf, 'start': start, 'ladder': names, 'keyint': KEYINT,
                                  'sizes': {name: SIZES[LABEL[name]] for name in RENDITIONS}})
         queues = {name: queue.Queue() for name in names}
@@ -153,6 +156,7 @@ def serve(args: argparse.Namespace) -> dict:
                 if kind == b'S':
                     message = json.loads(payload)
                     wanted = resolve(message.get('rung') or message.get('rendition', ''))
+                    report['requests'].append({'at': time.monotonic(), 'rung': wanted, 'skip': bool(message.get('skip'))})
                     if wanted is not None:
                         requested[0] = wanted
                         if message.get('skip'):
@@ -168,6 +172,7 @@ def serve(args: argparse.Namespace) -> dict:
         recent = {name: [] for name in names}  # packet sizes of the last KEYINT frames
         key_bytes = {}  # size of each rung's latest keyframe
         current, index, t0 = start, 0, None
+        previous_backlog = 0
         try:
             while True:
                 packets = {name: queues[name].get() for name in names}
@@ -177,11 +182,28 @@ def serve(args: argparse.Namespace) -> dict:
                     recent[name] = recent[name][-(KEYINT - 1):] + [len(packet.data)]
                     if packet.keyframe:
                         key_bytes[name] = len(packet.data)
+                # Wait for the frame's release time before acting on it. The encoder can
+                # run ahead of the release clock (frames read while ffmpeg starts up come
+                # out in a burst), and a switch or skip decided on dequeue would then
+                # apply to frames that are still seconds from release. The guard below
+                # also needs the backlog as it is when the frame would be sent.
+                now = time.monotonic()
+                if t0 is None:
+                    t0 = report['t0'] = now
+                    if link is not None:
+                        link.start_clock()
+                elif (wait := t0 + index / fps - now) > 0:
+                    report['max_encoder_lead_s'] = max(report['max_encoder_lead_s'], wait)
+                    time.sleep(wait)
+                elif -wait > 1 / fps:  # the encoder fell more than a frame behind the source
+                    report['late_releases'] += 1
+                    report['max_release_lag_s'] = max(report['max_release_lag_s'], -wait)
                 wanted = requested[0]
                 if packets[wanted].keyframe:
                     skipping[0] = False
                     if wanted != current:
-                        report['switches'].append({'frame': index, 'from': current, 'to': wanted})
+                        report['switches'].append({'frame': index, 'from': current, 'to': wanted,
+                                                   'at': time.monotonic()})
                         current = wanted
                 elif skipping[0]:
                     report['skipped'] += 1
@@ -190,24 +212,20 @@ def serve(args: argparse.Namespace) -> dict:
                 # Sender-side guard: do not add to a backlog that would take longer than
                 # --max-backlog-ms to drain. Dropping one frame breaks the rest of its
                 # group, so drop up to the next keyframe.
+                # Only while the backlog is still growing, that is, sending this frame
+                # would leave more queued than after the previous one: the stream is
+                # faster than the link. A shrinking backlog (the tail of a keyframe
+                # burst) drains by itself, and dropping the group would freeze the
+                # picture for longer than the late frames would.
                 waiting, rate = backlog_bytes(conn, link), client_kbps[0]
-                if rate and index > 0 and waiting * 8 / (rate * 1000) > limit_ms[0] / 1000:
+                growing = waiting + len(packets[current].data) > previous_backlog
+                if rate and index > 0 and growing and waiting * 8 / (rate * 1000) > limit_ms[0] / 1000:
                     skipping[0] = True
                     channel.send_json(b'G', {'frame': index, 'capacity_kbps': rate, 'backlog_bytes': waiting})
                     report['backlog_skips'] += 1
                     report['skipped'] += 1
                     index += 1
                     continue
-                now = time.monotonic()
-                if t0 is None:
-                    t0 = now
-                    if link is not None:
-                        link.start_clock()
-                elif (wait := t0 + index / fps - now) > 0:
-                    time.sleep(wait)
-                elif -wait > 1 / fps:  # the encoder fell more than a frame behind the source
-                    report['late_releases'] += 1
-                    report['max_release_lag_s'] = max(report['max_release_lag_s'], -wait)
                 packet = packets[current]._replace(sent=time.monotonic())
                 if index == 0 and not packet.keyframe:
                     raise RuntimeError('stream does not start with a keyframe')
@@ -216,6 +234,7 @@ def serve(args: argparse.Namespace) -> dict:
                         name: round(sum(sizes) * 8 * fps / len(sizes) / 1000, 1) for name, sizes in recent.items()},
                         'key_bytes': key_bytes})
                 channel.send_packet(packet)
+                previous_backlog = backlog_bytes(conn, link)  # including this packet
                 report['frames_by_rung'][current] = report['frames_by_rung'].get(current, 0) + 1
                 report['bytes_by_rung'][current] = report['bytes_by_rung'].get(current, 0) + len(packet.data)
                 index += 1

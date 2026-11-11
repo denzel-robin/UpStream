@@ -49,19 +49,26 @@ The client knows when each packet was sent (the server stamps it) and when it ar
 - **Queuing delay** is a packet's delay less the fixed delay and its own transmission
   time. The **standing queue** is the smallest over the last 0.5 s: a keyframe burst
   raises the delay for a few frames, a link slower than the stream raises it for good.
+- **Excess queue** is the queuing delay beyond what the last keyframe explains. A
+  P-frame sent while its keyframe is still crossing the link waits for the rest of it
+  (keyframe size / capacity, less the time since the keyframe was sent). Only delay
+  beyond that means the link has become slower than estimated.
 
 ### The decision
 
 On every packet:
 
 1. Drop rungs the client cannot run in time (resources) and rungs whose keyframe would
-   miss the latency budget.
+   not cross the link before the display deadline (playout delay plus drop-late less
+   processing; the frames queued behind such a keyframe are still shown).
 2. Set the bandwidth allowance:
-   - **drain**, when the queue is longer than the latency budget (playout delay less
-     25 ms for decoding and reconstruction): half the capacity estimate, and ask the
-     server to skip the rest of the group of pictures so the queue empties before the
-     switch. The screen holds the last frame meanwhile; pictures are never corrupted,
-     because the next frame sent is a keyframe.
+   - **drain**, when the standing queue or the excess queue is longer than the latency
+     budget (playout delay less 25 ms for decoding and reconstruction): half the
+     capacity estimate, and ask the server to skip the rest of the group of pictures so
+     the queue empties before the switch. The screen holds the last frame meanwhile;
+     pictures are never corrupted, because the next frame sent is a keyframe. The short
+     queue behind a keyframe does not trigger a drain: it clears by itself, and skipping
+     to the next keyframe would only repeat it.
    - **capacity**, when capacity is known: 85% of it, or 95% for the current rung, so
      an estimate near the edge does not flip rungs.
    - **probe**, only when no capacity estimate exists yet: after 4 quiet seconds, the
@@ -85,11 +92,16 @@ The server knows at once. It tracks what it has handed to the network but not ha
 delivered (`live/backlog.py`: the kernel's send queue, SIOCOUTQ, or the emulated
 link's queue). Before each frame, if that backlog would take longer to drain at the
 client's capacity estimate than the client can wait for a frame (playout delay plus
-drop-late less processing, sent by the client with the estimate in a C record), it
-drops frames up to the next keyframe and sends a G record. It drops only frames that
-would have arrived too late to be shown.
+drop-late less processing, sent by the client with the estimate in a C record), **and
+the backlog is growing** (sending this frame would leave more queued than after the
+previous one), it drops frames up to the next keyframe and sends a G record. A
+shrinking backlog is the tail of a keyframe burst and drains by itself; dropping the
+group then freezes the picture for longer than the few late frames would.
 
-Two variants failed and were removed:
+The server checks the guard, and applies switch and skip requests, at each frame's
+release time, not when the frame comes out of the encoder.
+
+Variants that failed and were removed:
 
 - **Measuring the drain rate on the server** from the backlog. The backlog is seen
   only once per frame and often empties in between, so the rate came out at a few
@@ -98,6 +110,14 @@ Two variants failed and were removed:
 - **Guarding at the controller's planning budget** (playout delay less processing)
   rather than at the display deadline. A single keyframe on a slow link exceeded it,
   so the guard dropped the group after almost every keyframe (38% of frames).
+- **Guarding without the growth test**, and **checking before the release wait** (found
+  in the mode comparison, docs/COMPARISON.md). Before the wait, the backlog is read
+  right after the previous send, before anything has drained, so every frame after a
+  keyframe looked like growth. Switches decided on dequeue also landed up to a second
+  late, after the next keyframe had already gone out on the old rung.
+- **Counting a record as queued until its last byte left** in the emulated link. A
+  socket's send queue shrinks as bytes leave; the link now counts only what is left of
+  the record on the wire.
 
 ### Why each rendition gets chosen
 
@@ -157,14 +177,18 @@ content; the quality side still uses the table's means.
 
 | Scenario | What the controller did | Late | Skipped | Max delay |
 |---|---|---:|---:|---:|
-| 3000, 700 at 20 s, 1800 at 40 s | direct@28; at the drop drained to x2@33 then x2@28; back to direct@28 | 9 | 21 | 429 ms |
-| 400, 150 at 20 s, 1000 at 40 s | x2@33; x4@33 at 150; x2@23 at 1000 | 7 | 23 | 259 ms |
+| 3000, 700 at 20 s, 1800 at 40 s | direct@28; at the drop drained to x2@33 then x2@28; back to direct@28 | 11 | 19 | 479 ms |
+| 400, 150 at 20 s, 1000 at 40 s | x2@33; x4@33 at 150; x2@23 at 1000 | 10 | 20 | 296 ms |
+| 2500, 500 at 20 s, 1500 at 40 s | direct; x2 and x4 at 500; x2 and direct at 1500 | 10 | 20 | 756 ms |
 | 800, GPU 5x slower at 20 s | x2@28; direct@38 when no exit fits the GPU share | 0 | 0 | 67 ms |
 
-Late and skipped are out of 1,800 frames (60 s). Without the GOP skip, the first
-scenario reached 2.9 s of delay and 182 late frames.
+Late and skipped are out of 1,800 frames (60 s), with the burst-aware drain. Late here
+means past the display deadline. Without the GOP skip, the first scenario reached 2.9 s
+of delay and 182 late frames.
 
-### Live, one machine (2026-11-11)
+### Live, one machine (2026-11-11, before the burst fixes)
+
+Superseded by the mode comparison in docs/COMPARISON.md, which also measures quality.
 
 RTX 3050 Laptop, float16, 30 s of a test clip, full ladder (13 rungs encoded at once,
 no late releases), emulated link 2500, 500 at 10 s, 1500 at 20 s, playout delay 150 ms.
