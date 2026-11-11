@@ -48,6 +48,19 @@ fits before the frame is due, capped at one frame interval. Expected times start
 the median of a warm-up run before connecting and then follow the measured times. A
 frame that is skipped on screen is still reconstructed, so the state has no gaps.
 
+`--display` shows the video in a window with a status overlay (rung, model exit and
+time, sent bitrate, link estimate, latency); `--compare` puts bicubic from the received
+frame on the left and UpStreamVSR on the right; Escape closes it. OpenCV is imported
+before PyAV when `--display` is given: PyAV bundles its own libxcb, and Qt hangs
+opening a window on that copy.
+
+```bash
+python live/server.py data/test-clips/NRqG3AEOVGg@1440.mp4 --crfs 18 23 28 33 \
+    --direct-crfs 23 28 33 38 43 --start x4@28 --link 0:2500,10:500,20:1500
+python live/client.py --checkpoint runs/kaggle-6-v3/run/best-calibrated.pt --controller \
+    --half --playout-delay 0.15 --display --compare
+```
+
 `--schedule 0:x4,90:x2,180:direct` sends switch requests at fixed frames;
 `--controller` lets the trade-off controller choose instead (docs/CONTROLLER.md). `--half` runs the model in float16.
 
