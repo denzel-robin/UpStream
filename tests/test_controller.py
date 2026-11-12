@@ -86,6 +86,16 @@ def test_controller_leaves_the_model_when_the_gpu_is_too_slow():
     assert controller.quality('x2@23') is None
 
 
+def test_controller_runs_the_model_late_when_the_ladder_has_no_direct_rung():
+    slow = {4: (30.0, 40.0, 50.0)}
+    ladder = [n for n in LADDER if n.startswith('x4')]
+    controller = TradeoffController(TABLE, ladder, 1 / 30, 0.1, policy=policy_with(slow))
+    controller.start('x4@28', 0.0)
+    end = feed_idle_link(controller, 2000)
+    decision = controller.decide(end)
+    assert decision is None or decision[0] in ladder
+
+
 def test_controller_credits_the_deepest_exit_that_fits():
     controller = TradeoffController(TABLE, LADDER, 1 / 30, 0.1, policy=policy_with({2: (5.0, 15.0, 25.0)}))
     assert controller.quality('x2@23') == TABLE['x2@23']['psnr'][1]  # 25 ms > 20 ms budget

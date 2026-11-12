@@ -281,6 +281,8 @@ class TradeoffController:
         runnable = {name: q for name in self.rungs if (q := self.quality(name)) is not None}
         if not runnable:  # the model fits nowhere: direct rungs need no GPU
             runnable = {n: self.table[n]['psnr'][0] for n, r in self.rungs.items() if r.scale == 1}
+        if not runnable:  # and the ladder has no direct rung: run the model anyway, late
+            runnable = {n: self.table[n]['psnr'][0] for n in self.rungs}
         options = {n: q for n, q in runnable.items() if self.burst_fits(n)}
         if not options:  # no keyframe fits the budget: the cheapest runnable rung
             cheapest = min(runnable, key=self.rate)

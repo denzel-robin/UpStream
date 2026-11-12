@@ -60,7 +60,14 @@ MODES = {
     'adaptive-fixed-depth': (ALL, 'x4@28', ['--fixed-exit', '-1'], []),
     'adaptive-no-gpu-awareness': (ALL, 'x4@28', ['--no-gpu-awareness'], []),
     'adaptive-no-guard': (ALL, 'x4@28', [], ['--no-guard']),
+    'x4-bicubic': (['x4'], 'x4@28', ['--upscaler', 'bicubic'], []),
 }
+# Published models in place of UpStreamVSR (upstream_vsr/baselines.py), with the same
+# controller; it times each model, so a model without x2 or too slow for the GPU budget
+# is kept to the rungs it can run.
+for _name in ('efrlfn', 'span', 'nanovsr', 'cdavsr'):
+    MODES[f'adaptive-{_name}'] = (ALL, 'x4@28', ['--upscaler', _name], [])
+    MODES[f'x4-{_name}'] = (['x4'], 'x4@28', ['--upscaler', _name] + (['--no-gpu-awareness'] if _name == 'cdavsr' else []), [])
 DEFAULT_MODES = ['direct', 'x2', 'x4', 'adaptive']
 PYTHON = sys.executable
 
@@ -309,6 +316,7 @@ def main() -> None:
     parser.add_argument('--keep-frames', action='store_true', help='keep the raw recordings (2.5 GB per 30 s run)')
     parser.add_argument('--out', type=Path, default=ROOT / 'results/compare')
     parser.add_argument('--port', type=int, default=8810)
+    parser.add_argument('--resume', action='store_true', help='reuse runs that already have quality.json')
     parser.add_argument('--gpu-load', help='background GPU load during each run, as size,busy_ms,idle_ms '
                         '(scripts/gpu_load.py), for example 8192,200,5')
     parser.add_argument('--netem', action='store_true',
@@ -335,6 +343,15 @@ def main() -> None:
             for mode in args.modes:
                 out = args.out / source.stem / mode
                 print(f'{source.name}: {mode}', flush=True)
+                if args.resume and (out / 'quality.json').exists():  # finished in an earlier, interrupted run
+                    client, server = (json.loads((out / f).read_text()) for f in ('client.json', 'server.json'))
+                    quality = json.loads((out / 'quality.json').read_text())
+                    gpu = gpu_stats(out / 'gpu.csv', client['resources']['unix_begin'], client['resources']['unix_end'])
+                    row = summarise(mode, client, server, quality, gpu, fps, phases)
+                    row['decisions'] = client.get('controller', {}).get('decisions', [])
+                    row['switches'] = client['summary'].get('switches', [])
+                    rows.append(row)
+                    continue
                 for attempt in range(3):  # ffmpeg occasionally crashes with 13 outputs; run again
                     client, server = run_mode(args, source, mode, out, port)
                     port += 1

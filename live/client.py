@@ -49,6 +49,7 @@ from live.policy import DepthPolicy  # noqa: E402
 from live.protocol import LABEL, SCALE, Channel, parse_packet, parse_rung, rung_name  # noqa: E402
 from upstream_vsr.encoding import SIZES  # noqa: E402
 from upstream_vsr.codec import MotionDecoder  # noqa: E402
+from upstream_vsr.baselines import NAMES as BASELINES, Baseline  # noqa: E402
 from upstream_vsr.model import UpStreamVSR, crf_to_quality  # noqa: E402
 
 END = object()
@@ -76,9 +77,10 @@ class Reconstructor:
     """Holds the model and its recurrent state; one call per decoded frame."""
 
     def __init__(self, model: UpStreamVSR | None, device: torch.device, policy: DepthPolicy | None, half: bool,
-                 bicubic: bool = False):
+                 bicubic: bool = False, baseline: Baseline | None = None):
         self.model, self.device, self.policy, self.half = model, device, policy, half
         self.bicubic = bicubic  # ablation: bicubic in place of the model, same rung choices
+        self.baseline = baseline  # comparison: a published model in place of UpStreamVSR
         self.dtype = torch.float16 if half else torch.float32
         self.state = None
         self.last_scale = None
@@ -96,6 +98,17 @@ class Reconstructor:
             width, height = SIZES[LABEL[name]]
             frame = np.zeros((height, width, 3), np.uint8)
             motion = np.zeros((height // 4, width // 4, 2), np.float32)
+            if self.baseline is not None:
+                # One depth: every exit gets the baseline's time, so the controller prices
+                # its rungs by what it really costs. A scale it lacks never fits.
+                times = [float('inf')]
+                if SCALE[name] in self.baseline.scales:
+                    self.baseline.reset()
+                    times = [self.run_baseline({'rgb': frame, 'mv': motion, 'is_intra': False}, SCALE[name])[1]['model_s']
+                             for _ in range(steps)][steps // 3:]
+                for exit_index in range(len(self.model.exits)):
+                    self.policy.expected[(SCALE[name], exit_index)] = float(np.median(times))
+                continue
             for exit_index in range(len(self.model.exits)):
                 self.state, times = None, []
                 for _ in range(steps):
@@ -124,6 +137,16 @@ class Reconstructor:
         frame = y[0].clamp(0, 1).mul(255).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
         return frame, {'exit': None, 'model_s': time.perf_counter() - begin, 'bicubic': True}
 
+    def run_baseline(self, item: dict, scale: int) -> tuple[np.ndarray, dict]:
+        begin = time.perf_counter()
+        output = self.baseline.step(self.to_device(item['rgb'], 1 / 255), self.to_device(item['mv']),
+                                    item['is_intra'], scale)
+        frame = output[0].mul(255).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+        seconds = time.perf_counter() - begin
+        for exit_index in range(self.policy.num_exits):
+            self.policy.update(scale, exit_index, seconds)
+        return frame, {'exit': 0, 'model_s': seconds, 'upscaler': self.baseline.name}
+
     def __call__(self, item: dict, time_left: float) -> tuple[np.ndarray, dict]:
         scale = SCALE[item['rendition']]
         if scale == 1 or self.model is None:
@@ -135,6 +158,12 @@ class Reconstructor:
         self.last_scale = scale
         if self.bicubic:
             return self.upscale_bicubic(item['rgb'], scale)
+        if self.baseline is not None:
+            if scale not in self.baseline.scales:  # only if the controller was told to use it anyway
+                return self.upscale_bicubic(item['rgb'], scale)
+            if self.last_scale != scale:
+                self.baseline.reset()
+            return self.run_baseline(item, scale)
         exit_index = self.policy.choose(scale, time_left)
         frame, seconds = self.run(item['rgb'], item['mv'], item['is_intra'], scale, exit_index, item['crf'])
         return frame, {'exit': exit_index, 'model_s': seconds}
@@ -207,7 +236,8 @@ def run(args: argparse.Namespace) -> dict:
               'schedule': schedule, 'frames': [], 'errors': [], 'skipped': 0, 'guard': [],
               'ablation': {'upscaler': args.upscaler, 'fixed_exit': args.fixed_exit, 'gpu_aware': args.gpu_aware}}
     policy = None
-    reconstruct = Reconstructor(model, device, None, args.half, bicubic=args.upscaler == 'bicubic')
+    baseline = Baseline(args.upscaler, device, args.half) if args.upscaler in BASELINES else None
+    reconstruct = Reconstructor(model, device, None, args.half, bicubic=args.upscaler == 'bicubic', baseline=baseline)
     if model is not None:
         report['model_config'] = model.config()
         # Frame interval is not known until the header; 30 fps until then.
@@ -368,7 +398,8 @@ def run(args: argparse.Namespace) -> dict:
                 if item['exit'] is None:
                     model = 'no model (sent as 720p)'
                 else:
-                    model = f"UpStreamVSR {size} -> 720p, exit {item['exit'] + 1}, {item['model_s'] * 1000:.1f} ms"
+                    model = (f"{baseline.name} {size} -> 720p, {item['model_s'] * 1000:.1f} ms" if baseline else
+                             f"UpStreamVSR {size} -> 720p, exit {item['exit'] + 1}, {item['model_s'] * 1000:.1f} ms")
                 capacity = f'{controller.capacity:.0f} kbit/s' if controller and controller.capacity else 'measuring'
                 lines = [f'{name}   {model}',
                          f'sent {sum(b for _, b in recent_bytes) * 8 / 1000:.0f} kbit/s   link estimate {capacity}',
@@ -483,8 +514,9 @@ def main() -> None:
     parser.add_argument('--drop-late', type=float, default=0.05, help='skip showing a frame this much past due')
     parser.add_argument('--queue', type=int, default=8, help='frames each stage may buffer')
     parser.add_argument('--half', action='store_true', help='float16 inference')
-    parser.add_argument('--upscaler', choices=['model', 'bicubic'], default='model',
-                        help='ablation: bicubic upscales x2/x4 frames instead of UpStreamVSR (the controller is unchanged)')
+    parser.add_argument('--upscaler', choices=['model', 'bicubic', *BASELINES], default='model',
+                        help='bicubic (ablation) or a published model (upstream_vsr/baselines.py) upscales x2/x4 '
+                             'frames instead of UpStreamVSR; the controller is unchanged and times it')
     parser.add_argument('--fixed-exit', type=int, help='ablation: always this exit (-1 = deepest), not the anytime choice')
     parser.add_argument('--no-gpu-awareness', dest='gpu_aware', action='store_false',
                         help='ablation: the controller assumes the deepest exit always fits')
