@@ -19,8 +19,8 @@ SPAN within 0.002 and NanoVSR within 0.0003 (on a [0, 1] scale). To run them liv
   of its training sequences.
 - CDA-VSR uses torchvision's modulated deformable convolution in place of mmcv's (same
   operation and weights). The residual map is the motion-compensation error, because the
-  client has no decoder residuals. The motion-vector sign was chosen per clip as the one
-  that scored best (the codec's own convention: frame to reference).
+  client has no decoder residuals. Of the two motion-vector signs, and no motion, the
+  codec's own convention (frame to reference) scored best on three clips, so it is used.
 
 ## Offline: every rung, 18 test clips
 
