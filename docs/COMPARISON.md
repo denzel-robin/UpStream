@@ -321,7 +321,7 @@ accumulated state.
 | **Second pass minus first, same clip, mean (range over 18 clips), dB** | **−0.000 (−0.016 to +0.019)** | **+0.003 (−0.016 to +0.029)** |
 | Largest state value, first / last window (overall) | 13.5 / 14.0 (18.3) | 12.1 / 9.8 (16.4) |
 | Frames with NaN or inf | 0 | 0 |
-| Model time per frame | 4.5 ms | 7.0 ms, every window |
+| Model time per frame, median (slowest after the first two frames) | 3.9 ms (4.8) | 7.0 ms (11.4) |
 
 **No collapse.**
 - On identical content, the gain after 9 minutes of carried state matches the first
