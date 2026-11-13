@@ -301,3 +301,38 @@ well as with the link):
 
 x4 only is the steadier stream (fewer skips, lower worst-case latency) but scores
 1.7 dB lower and uses 65% more GPU time.
+
+## 18-minute long run: does the recurrent state drift? (2026-11-13)
+
+The model never resets its state, not even at keyframes (the I-frame flag only feeds
+the gate), so a slow drift would show only in long streams. `scripts/long_run.py`
+feeds one continuous stream to the model with no reset: all 18 test clips, 30 s each
+(9 minutes), played twice in a row (18 minutes, 32,410 frames;
+`scripts/make_long_source.sh`). The x2@23 and x4@23 streams use the live x264 settings
+(keyframe every 30 frames), each with its own state, float16, deepest exit. Bicubic
+runs on the same frames as a reference without memory. The second pass repeats the
+first frame for frame, so it shows the same content after 9 more minutes of
+accumulated state.
+
+| | x2@23 | x4@23 |
+|---|---:|---:|
+| PSNR, model / bicubic, dB | 33.96 / 32.74 | 29.76 / 28.42 |
+| Gain over bicubic, mean (lowest 30 s window), dB | +1.22 (+0.49) | +1.33 (+0.68) |
+| **Second pass minus first, same clip, mean (range over 18 clips), dB** | **−0.000 (−0.016 to +0.019)** | **+0.003 (−0.016 to +0.029)** |
+| Largest state value, first / last window (overall) | 13.5 / 14.0 (18.3) | 12.1 / 9.8 (16.4) |
+| Frames with NaN or inf | 0 | 0 |
+| Model time per frame | 4.5 ms | 7.0 ms, every window |
+
+**No collapse.**
+- On identical content, the gain after 9 minutes of carried state matches the first
+  pass to within 0.03 dB on every clip, with no sign either way.
+- The state stays bounded. Its largest value tracks the content (8–18, the same in
+  both passes) and does not grow.
+- Model time stayed at 7.0 ms for x4 in every window. The GPU ran at 78–81 °C,
+  warmer than the live run because this ran flat out, faster than real time.
+- The gain moves between clips (+0.5 to +2.8 dB) with content, not with time. Its
+  linear trend over 18 minutes (−0.01 to −0.02 dB per minute) repeats in both passes,
+  so it comes from the order of the clips.
+
+`python scripts/long_run.py` (about 20 minutes on the RTX 3050 Laptop; results in
+results/long/: summary.json per 30 s window, frames.npz per frame).
