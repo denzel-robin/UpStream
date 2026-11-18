@@ -307,7 +307,7 @@ def markdown(rows: list[dict]) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('sources', type=Path, nargs='+')
-    parser.add_argument('--checkpoint', type=Path, default=ROOT / 'runs/kaggle-6-v3/run/best-calibrated.pt')
+    parser.add_argument('--checkpoint', type=Path, default=ROOT / 'runs/kaggle-7-no-state/run/best-calibrated.pt')
     parser.add_argument('--modes', nargs='+', default=DEFAULT_MODES, choices=list(MODES))
     parser.add_argument('--link', default='0:2500,10:500,20:1500')
     parser.add_argument('--seconds', type=float, default=30)

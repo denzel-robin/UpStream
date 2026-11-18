@@ -25,35 +25,50 @@ the GPU at 98% utilisation and slows the deepest x4 exit from 7.9 ms to about 21
 
 ## Results (sums or means over the three clips)
 
+Final model (no recurrent state, 2026-11-18; results/final/ablation-idle and -loaded):
+
 | Variant | Viewer PSNR dB | Shown / late / skipped | Latency p95 ms | Model GPU % | GPU power W |
 |---|---:|---:|---:|---:|---:|
-| **adaptive, idle GPU** | **31.51** | 2473 / 60 / 167 | 164 | 15.6 | 21.1 |
+| **adaptive, idle GPU** | **31.44** | 2466 / 69 / 165 | 169 | 13.9 | 20.4 |
+| bicubic in place of the model | 30.68 (−0.76) | 2464 / 72 / 164 | 167 | 6.3 | 17.8 |
+| no backlog guard | 30.61 (−0.83) | 2354 / 133 / 213 | 324 | 13.2 | 20.1 |
+| **adaptive, loaded GPU** | **31.41** | 2455 / 79 / 166 | 177 | 34.2 | 73.7 |
+| fixed depth (deepest exit) | 31.38 (−0.03) | 2450 / 84 / 166 | 181 | 34.6 | 74.0 |
+| no GPU awareness | 31.41 (0.00) | 2455 / 78 / 167 | 177 | 34.3 | 74.3 |
+
+Earlier model with recurrent state (results/ablation-idle and -loaded):
+
+| Variant | Viewer PSNR dB | Shown / late / skipped | Latency p95 ms | Model GPU % | GPU power W |
+|---|---:|---:|---:|---:|---:|
+| adaptive, idle GPU | 31.51 | 2473 / 60 / 167 | 164 | 15.6 | 21.1 |
 | bicubic in place of the model | 30.73 (−0.78) | 2472 / 61 / 167 | 163 | 6.3 | 18.0 |
 | no backlog guard | 30.62 (−0.89) | 2353 / 134 / 213 | 326 | 15.0 | 20.7 |
-| **adaptive, loaded GPU** | **31.46** | 2454 / 80 / 166 | 178 | 36.6 | 74.1 |
+| adaptive, loaded GPU | 31.46 | 2454 / 80 / 166 | 178 | 36.6 | 74.1 |
 | fixed depth (deepest exit) | 31.35 (−0.11) | 2432 / 99 / 169 | 188 | 37.1 | 74.2 |
 | no GPU awareness | 31.56 (+0.10) | 2455 / 73 / 172 | 180 | 37.7 | 73.8 |
 
 ## What each result says
 
 - **The model.** With delivery identical (the same frames shown, late and skipped),
-  replacing UpStreamVSR with bicubic loses 0.78 dB over all frames. About 70% of the frames
-  are x2/x4, so the model adds about 1.1 dB on each upscaled frame, for 9 percentage
+  replacing UpStreamVSR with bicubic loses 0.76 dB over all frames. About 70% of the frames
+  are x2/x4, so the model adds about 1.1 dB on each upscaled frame, for 8 percentage
   points of GPU time and 3 W. This is the model's live contribution, separate from the
   controller's.
-- **The backlog guard** is the largest single contribution: without it, late frames more
-  than double (60 → 134), p95 latency doubles (164 → 326 ms), the longest freeze
-  grows, and viewer PSNR falls 0.89 dB. Frames queued behind a link drop arrive too late to
+- **The backlog guard** is the largest single contribution: without it, late frames
+  roughly double (69 → 133), p95 latency doubles (169 → 324 ms), the longest freeze
+  grows, and viewer PSNR falls 0.83 dB. Frames queued behind a link drop arrive too late to
   show, and the screen holds stale frames longer than the guard's deliberate skip.
-- **Anytime exits** help a little under load: 19 fewer late frames (80 vs 99) and
-  +0.11 dB. The policy took a shallow exit on about 6% of upscaled frames, when the time
-  left before the deadline was short. The benefit is small on this GPU because even the
-  deepest exit usually fits; it grows on slower hardware.
-- **GPU awareness** made no measurable difference here (+0.10 dB without it, within
-  run-to-run noise): even with the GPU saturated by another process, the deepest x2 exit
-  and the shallow x4 exit fit the 20 ms model budget, so the controller never had a
-  rung to exclude. It is a safeguard for weaker GPUs. On those it moves the stream to direct
-  rungs instead of running a model that cannot keep up; this is covered by
+- **Anytime exits** matter little on this GPU. With the earlier, slower model they saved
+  19 late frames under load (+0.11 dB); with the final model, 5 late frames (+0.03 dB),
+  because even the deepest exit (5.0 ms at x4 when idle) fits easily. The policy still
+  takes a shallow exit on about 6% of upscaled frames under load. The benefit grows on
+  slower hardware.
+- **GPU awareness** made no measurable difference here (0.00 dB with the final model,
+  +0.10 with the earlier one, within run-to-run noise): even with the GPU saturated by
+  another process, the deepest x2 exit and the shallow x4 exit fit the 20 ms model
+  budget, so the controller never had a rung to exclude. It is a safeguard for weaker
+  GPUs. On those it moves the stream to direct rungs instead of running a model that
+  cannot keep up; this is covered by
   `tests/test_controller.py::test_controller_leaves_the_model_when_the_gpu_is_too_slow`
   but not shown on this laptop.
 
@@ -66,7 +81,8 @@ x4 only, so the x2 rows compare two models that differ only by training run: the
 gap (0.03–0.06 dB) is the noise floor between runs.
 
 Offline, 18 test clips, every rung (`python scripts/benchmark_baselines.py --half
---models upstream no-state bicubic`, results/no-state/offline.json). PSNR dB /
+--models upstream with-state bicubic`, results/no-state/offline.json, where that
+run's keys are `upstream` for the model with state and `no-state` for the final one). PSNR dB /
 temporal PSNR dB (higher is steadier) / median ms per frame on the RTX 3050 Laptop:
 
 | Rung | With state (final) | No state | Bicubic |

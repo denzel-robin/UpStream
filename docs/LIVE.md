@@ -57,7 +57,7 @@ opening a window on that copy.
 ```bash
 python live/server.py data/test-clips/NRqG3AEOVGg@1440.mp4 --crfs 18 23 28 33 \
     --direct-crfs 23 28 33 38 43 --start x4@28 --link 0:2500,10:500,20:1500
-python live/client.py --checkpoint runs/kaggle-6-v3/run/best-calibrated.pt --controller \
+python live/client.py --checkpoint runs/kaggle-7-no-state/run/best-calibrated.pt --controller \
     --half --playout-delay 0.15 --display --compare
 ```
 

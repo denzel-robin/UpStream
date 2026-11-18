@@ -5,7 +5,7 @@ Every test clip is encoded with the live ladder (as scripts/measure_rate_quality
 does), decoded with motion vectors, and upscaled one frame at a time, causally, by:
 
   upstream   UpStreamVSR, deepest exit (the live client's usual choice)
-  no-state   the no-state ablation (--no-state-checkpoint), memory cleared every frame
+  with-state the earlier model with recurrent state (--with-state-checkpoint), for the ablation
   bicubic
   efrlfn, span, nanovsr, cdavsr   (upstream_vsr/baselines.py; nanovsr and cdavsr are x4 only)
 
@@ -43,8 +43,7 @@ from upstream_vsr.model import crf_to_quality  # noqa: E402
 class Upstream:
     """UpStreamVSR behind the baselines' step() interface."""
 
-    def __init__(self, checkpoint: Path, device, half: bool, stateless: bool = False):
-        self.stateless = stateless  # the no-state ablation: memory cleared before every frame
+    def __init__(self, checkpoint: Path, device, half: bool):
         self.model = load_model(checkpoint, device, half)
         self.dtype = torch.float16 if half else torch.float32
         self.device, self.scales, self.state, self.crf = device, (2, 4), None, 23
@@ -56,8 +55,6 @@ class Upstream:
 
     @torch.inference_mode()
     def step(self, x, mv, is_intra, scale):
-        if self.stateless:
-            self.state = None
         intra = torch.tensor([float(is_intra)], device=self.device, dtype=self.dtype)
         quality = crf_to_quality(self.crf).view(1).to(self.device, self.dtype)
         out, self.state = self.model.step(x.to(self.dtype), mv.to(self.dtype), intra, self.state, scale, self.exit,
@@ -96,9 +93,9 @@ def run(model, frames, gt, scale: int, device) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--checkpoint', type=Path, default=ROOT / 'runs/kaggle-6-v3/run/best-calibrated.pt')
-    parser.add_argument('--no-state-checkpoint', type=Path,
-                        default=ROOT / 'runs/kaggle-7-no-state/run/best-calibrated.pt')
+    parser.add_argument('--checkpoint', type=Path, default=ROOT / 'runs/kaggle-7-no-state/run/best-calibrated.pt')
+    parser.add_argument('--with-state-checkpoint', type=Path,
+                        default=ROOT / 'runs/kaggle-6-v3/run/best-calibrated.pt')
     parser.add_argument('--clips', type=Path, default=ROOT / 'data/test-clips')
     parser.add_argument('--limit', type=int)
     parser.add_argument('--seconds', type=float, default=4.0)
@@ -113,7 +110,7 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats()
         before = torch.cuda.memory_allocated()
         models[name] = (Upstream(args.checkpoint, device, args.half) if name == 'upstream' else
-                        Upstream(args.no_state_checkpoint, device, args.half, stateless=True) if name == 'no-state' else
+                        Upstream(args.with_state_checkpoint, device, args.half) if name == 'with-state' else
                         Bicubic() if name == 'bicubic' else Baseline(name, device, args.half))
         memory[name] = {'weights_mib': (torch.cuda.memory_allocated() - before) / 2 ** 20}
 
@@ -137,7 +134,7 @@ def main() -> None:
                 for name, model in models.items():
                     if scale not in model.scales:
                         continue
-                    if name in ('upstream', 'no-state'):
+                    if name in ('upstream', 'with-state'):
                         model.crf = crf
                     torch.cuda.reset_peak_memory_stats()
                     entry[name] = run(model, frames, gt, scale, device)

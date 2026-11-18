@@ -347,10 +347,33 @@ Live run, same setup as docs/LIVE.md: 300 frames, none dropped; ready 13.5 ms af
 release in float32 and 12.0 ms in float16; model 10.9 / 8.8 ms at x4 and 7.6 / 5.6 ms at
 x2 (float32 / float16, deepest exit).
 
+## Final model: no recurrent state (2026-11-18)
+
+Kaggle run `upstream-7-no-state`: the third design with the same recipe (32 channels,
+exits 3/6/9, flicker weight 0.05, 70,000 iterations, same data), trained with the state
+cleared before every frame. Checkpoint: `runs/kaggle-7-no-state/run/best-calibrated.pt`,
+now the default everywhere. `live.client.load_model` reads `no_state` from the
+checkpoint and sets `use_state = False`, so `step()` ignores any state it is given.
+
+Test set (64 windows), PSNR / temporal PSNR in dB:
+
+| | Bicubic | Exit 1 | Exit 2 | Exit 3 | With state (upstream-6-v3, exit 3) |
+|---|---:|---:|---:|---:|---:|
+| x2 | 31.86 / 37.32 | 32.62 | 32.66 | **32.67 / 37.74** | 32.68 / 37.75 |
+| x4 | 27.98 / 35.00 | 28.92 | 29.07 | **29.10 / 35.52** | 29.13 / 35.29 |
+
+Why the state went (docs/ABLATION.md): the 0.22 dB lost by resetting the state of the
+model trained with it was not what the state adds. A model trained without it recovers
+all but 0.02–0.05 dB, below the noise between training runs, and is 65% faster at x4
+(5.0 vs 8.2 ms) and steadier at every x4 rung. With no state, the codec motion vectors
+and motion refinement are unused; the model is a per-frame upscaler with CRF
+conditioning, anytime exits and one network for x2 and x4. The temporal path stays in
+the code for the ablation.
+
 ## Open risks
 
-1. **Memory adds flicker.** It now gives 0.22 dB at x4 but makes the output slightly less
-   steady than with state reset. Try a higher flicker weight in the 48-channel run.
+1. **Memory adds flicker.** Resolved: the final model has no state (see above), and is
+   steadier than bicubic at every rung.
 2. **Depth gives a small range** (0.07 to 0.11 dB from first to last exit). The width
    run tests whether more channels widen it.
 3. **Direct delivery may still win.** The earlier study found it beat NanoVSR at matched

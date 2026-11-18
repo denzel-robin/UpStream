@@ -315,3 +315,24 @@ def test_fused_v3_matches_training_structure():
         _, state = model.step(x, mv, intra, None, 4, quality=quality)
         actual, _ = model.step(x, mv, intra, state, 4, quality=quality)
     assert torch.allclose(actual, expected, atol=1e-5)
+
+
+@torch.no_grad()
+def test_stateless_model_ignores_the_state_it_is_given():
+    model = trained_like_model()
+    x, mv, intra = inputs(4)
+    _, state = model.step(x, mv, intra, None, 4)
+    _, state = model.step(x.flip(-1), mv, intra, state, 4)
+    fresh, _ = model.step(x, mv, intra, None, 4)
+    assert not torch.allclose(model.step(x, mv, intra, state, 4)[0], fresh)
+    model.use_state = False
+    assert torch.equal(model.step(x, mv, intra, state, 4)[0], fresh)
+
+
+def test_load_model_sets_use_state_from_the_checkpoint(tmp_path):
+    from live.client import load_model
+    model = UpStreamVSR(num_feat=8, exits=(1, 2))
+    for no_state in (False, True):
+        path = tmp_path / f'{no_state}.pt'
+        torch.save({'config': model.config(), 'model': model.state_dict(), 'no_state': no_state}, path)
+        assert load_model(path, torch.device('cpu'), half=False).use_state is not no_state

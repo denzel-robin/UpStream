@@ -59,6 +59,7 @@ def load_model(path: Path, device: torch.device, half: bool) -> UpStreamVSR:
     checkpoint = torch.load(path, map_location='cpu', weights_only=True)
     model = UpStreamVSR(**checkpoint['config'])
     model.load_checkpoint_state(checkpoint['model'])
+    model.use_state = not checkpoint.get('no_state', False)
     model = model.eval().fuse().to(device)
     return model.half() if half else model
 

@@ -126,7 +126,7 @@ def summarise(frames: dict, gpu: list[dict], clips: int) -> dict:
 @torch.inference_mode()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--checkpoint', type=Path, default=ROOT / 'runs/kaggle-6-v3/run/best-calibrated.pt')
+    parser.add_argument('--checkpoint', type=Path, default=ROOT / 'runs/kaggle-7-no-state/run/best-calibrated.pt')
     parser.add_argument('--once', type=Path, default=ROOT / 'data/long/once.mp4')
     parser.add_argument('--twice', type=Path, default=ROOT / 'data/long/twice.mp4')
     parser.add_argument('--crf', type=int, default=23)

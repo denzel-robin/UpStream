@@ -336,3 +336,43 @@ accumulated state.
 
 `python scripts/long_run.py` (about 20 minutes on the RTX 3050 Laptop; results in
 results/long/: summary.json per 30 s window, frames.npz per frame).
+
+## Re-run with the final model, no recurrent state (2026-11-18)
+
+The final model (`runs/kaggle-7-no-state`, docs/MODEL.md) replaces the model with
+recurrent state. The rate-quality table (configs/rate_quality.json) was re-measured with
+it, and the emulated-link comparison and the 5-minute sustained run repeated with the
+same clips, link and settings (results/final/). The 18-minute long run above tested the
+recurrent state, which the final model no longer has.
+
+Emulated link (three clips, sums or means; earlier model in brackets):
+
+| Mode | Viewer PSNR dB | Shown / late / skipped | Latency p95 ms | Model GPU % | GPU W | kbps |
+|---|---:|---:|---:|---:|---:|---:|
+| direct | 30.75 (30.74) | 2391 / 71 / 238 | 168 | 0.0 | 13.1 | 582 |
+| x2 | 31.84 (31.75) | 2497 / 49 / 154 | 162 | 18.4 (18.3) | 21.4 | 611 |
+| x4 | 28.95 (28.93) | 2610 / 22 / 68 | 156 | **19.6 (28.1)** | **22.4 (25.2)** | 392 |
+| **adaptive** | **31.49** (31.64) | 2474 / 59 / 167 | 163 | **13.9 (15.6)** | 20.7 (21.3) | 643 |
+
+Five-minute sustained run:
+
+| | adaptive | x4 only |
+|---|---:|---:|
+| Frames shown / late / skipped | 8507 / 121 / 372 | 8858 / 29 / 113 |
+| Display latency p50 / p95 / max, ms | 155 / 160 / 945 | 155 / 156 / 350 |
+| Viewer / shown PSNR, dB | 30.85 / 31.71 (30.87 / 31.73) | 29.10 / 29.30 (29.16 / 29.37) |
+| Model time per frame, mean, ms | 6.6 (7.6) | 6.8 (9.7) |
+| Model GPU time, % of wall time | 15.1 (17.4) | **20.1 (28.8)** |
+| GPU power, W (mean) | 20.9 (20.7) | 22.4 (25.3) |
+| Peak model memory, MiB | **69 (94)** | **69 (94)** |
+| GPU temperature, max °C | 63 (63) | 63 (65) |
+
+- **Quality is unchanged within run-to-run noise.** x4 only, where delivery is
+  identical, matches to 0.02–0.06 dB. Adaptive is 0.15 dB lower here, but the earlier
+  model's own adaptive runs ranged from 31.50 to 31.64 dB across the three idle-GPU sets in this
+  repository (comparison, ablation, baselines); the final model's three are 31.39–31.49 dB. The difference is at
+  most about 0.1 dB.
+- **The cost falls.** At x4 the model uses 30% less GPU time (19.6% vs 28.1%) and 3 W
+  less, and peak memory drops from 94 to 69 MiB, because no state is kept.
+- **Still 30 fps for 5 minutes, latency flat** at a 155 ms median; the controller made
+  the same rendition choices (x2 54%, direct 20%, x4 22%).

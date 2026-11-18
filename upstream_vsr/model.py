@@ -20,6 +20,11 @@ Additions in this project:
   vectors per grid pixel before the state is warped.
 * Memory per scale: the temporal path can be switched off for a scale where it
   does not pay for its cost (x2 by default).
+* Stateless option: the final model (runs/kaggle-7-no-state) was trained with the
+  state cleared before every frame, because the ablation (docs/ABLATION.md) found
+  the state adds no measurable quality at x4, costs 65% more time and adds flicker.
+  `use_state = False` (set by live.client.load_model from the checkpoint) makes
+  step() ignore any state it is given. The temporal path is kept for that ablation.
 * Stream-quality conditioning: the encoder's CRF, known to the server, scales and
   shifts the entry features, so the model knows how much compression to undo.
 
@@ -185,6 +190,7 @@ class UpStreamVSR(nn.Module):
         self.memory_scales = tuple(memory_scales)
         self.refine_motion = refine_motion
         self.quality_conditioning = quality_conditioning
+        self.use_state = True  # False for a model trained with no_state
         self.entry = nn.ModuleDict({
             'x2': RepBlock(3 * 4, num_feat, scales=(2,)),  # pixel-unshuffled onto the grid
             'x4': RepBlock(3, num_feat, scales=(4,)),
@@ -261,6 +267,8 @@ class UpStreamVSR(nn.Module):
             (output, new_state), where output is (B, 3, H*scale, W*scale), or a list
             with one output per exit when all_exits is set.
         """
+        if not self.use_state:
+            state = None
         if scale == 4:
             grid_x, feat = x, self.entry['x4'](x, 4)
             flow = F.interpolate(mv, scale_factor=4, mode='nearest')

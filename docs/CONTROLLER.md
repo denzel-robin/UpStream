@@ -222,10 +222,10 @@ video or GPU. `--link` on the server puts the same kind of bottleneck
 propagation delay and loss) is milestone 5.
 
 ```bash
-python scripts/measure_rate_quality.py --checkpoint runs/kaggle-6-v3/run/best-calibrated.pt
+python scripts/measure_rate_quality.py --checkpoint runs/kaggle-7-no-state/run/best-calibrated.pt
 python live/simulate.py --link 0:3000,20:700,40:1800 --seconds 60
 python live/server.py data/test-clips/NRqG3AEOVGg@1440.mp4 --seconds 60 --start x4@28 \
     --crfs 18 23 28 33 --direct-crfs 23 28 33 38 43 --link 0:3000,20:700,40:1800
-python live/client.py --checkpoint runs/kaggle-6-v3/run/best-calibrated.pt --controller \
+python live/client.py --checkpoint runs/kaggle-7-no-state/run/best-calibrated.pt --controller \
     --playout-delay 0.15 --half --report results/controller.json
 ```
