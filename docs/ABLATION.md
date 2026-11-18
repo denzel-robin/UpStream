@@ -57,9 +57,36 @@ the GPU at 98% utilisation and slows the deepest x4 exit from 7.9 ms to about 21
   `tests/test_controller.py::test_controller_leaves_the_model_when_the_gpu_is_too_slow`
   but not shown on this laptop.
 
-Still to run: the model trained without recurrent state (Kaggle, about 9.5 h of GPU
-quota; `kaggle/2b_train_no_state.ipynb`), which decides whether the memory of earlier
-frames earns its cost.
+## The recurrent state (2026-11-18)
+
+The same recipe as the final model (32 channels, flicker loss 0.05, 70k iterations,
+the same data; `kaggle/2b_train_no_state.ipynb`, Kaggle run upstream-7-no-state) with
+the state cleared before every frame, in training and at inference. Memory is used at
+x4 only, so the x2 rows compare two models that differ only by training run: their
+gap (0.03–0.06 dB) is the noise floor between runs.
+
+Offline, 18 test clips, every rung (`python scripts/benchmark_baselines.py --half
+--models upstream no-state bicubic`, results/no-state/offline.json). PSNR dB /
+temporal PSNR dB (higher is steadier) / median ms per frame on the RTX 3050 Laptop:
+
+| Rung | With state (final) | No state | Bicubic |
+|---|---|---|---|
+| x2@18 | 36.97 / 41.60 / 4.6 | 36.90 / 41.60 / 4.6 | 35.67 / 40.96 |
+| x2@33 | 32.28 / 37.48 / 4.6 | 32.25 / 37.47 / 4.6 | 31.76 / 37.31 |
+| x4@18 | 33.11 / 38.69 / 8.2 | 33.09 / **38.83** / **5.0** | 31.61 / 38.08 |
+| x4@23 | 32.27 / 37.57 / 8.3 | 32.23 / **37.92** / **5.0** | 30.96 / 37.37 |
+| x4@28 | 31.00 / 36.36 / 8.2 | 30.95 / **36.80** / **5.0** | 30.02 / 36.50 |
+| x4@33 | 29.39 / 34.76 / 8.3 | 29.34 / **35.58** / **5.0** | 28.80 / 35.51 |
+
+Kaggle's own validation and test windows (12 frames) agree: at x4 the state adds
+0.04 dB (test 29.133 vs 29.095) and the model without it is steadier (35.52 vs 35.29).
+
+- **The state does not earn its cost.** At x4 it adds 0.02–0.05 dB, below the noise
+  floor between training runs. Per clip it ranges from −0.39 to +0.21 dB at x4@18.
+- **It costs 65% more x4 time** (8.2 vs 5.0 ms): warping, motion refinement and fusion.
+- **It is the source of the flicker.** Without it, the model is steadier at every x4
+  rung, and at x4@28–33 steadier than bicubic too. That removes the one weakness found
+  against the published models (docs/BASELINES.md).
 
 Results: `results/ablation-idle/`, `results/ablation-loaded/` (summary.json, per-clip
-reports).
+reports), `results/no-state/`.
