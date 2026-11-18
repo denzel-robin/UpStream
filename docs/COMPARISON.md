@@ -376,3 +376,31 @@ Five-minute sustained run:
   less, and peak memory drops from 94 to 69 MiB, because no state is kept.
 - **Still 30 fps for 5 minutes, latency flat** at a 155 ms median; the controller made
   the same rendition choices (x2 54%, direct 20%, x4 22%).
+
+### tc netem, final model (2026-11-18)
+
+`sudo bash scripts/run_netem.sh full` repeated with the final model; same clips,
+profiles and rate schedule (results/netem-broadband, results/netem-mobile; the earlier
+runs are kept in results/netem-*-with-state). Sums or means over three clips, earlier
+model in brackets:
+
+| Profile | Mode | Viewer PSNR dB | Shown / late / skipped | Latency p95 ms | Model GPU % |
+|---|---|---:|---:|---:|---:|
+| broadband | direct | 28.03 (27.77) | 1830 / 31 / 839 | 156 | 0.0 |
+| broadband | x2 | 27.73 (28.33) | 1884 / 65 / 751 | 170 | 13.5 |
+| broadband | x4 | 28.85 (28.55) | 2583 / 12 / 105 | 157 | 20.0 (27.6) |
+| broadband | **adaptive** | **30.35** (30.47) | 2297 / 59 / 344 | 170 | 12.6 (15.3) |
+| mobile | direct | 24.58 (24.04) | 1295 / 111 / 1294 | 264 | 0.0 |
+| mobile | x2 | 25.72 (26.53) | 1436 / 108 / 1156 | 237 | 12.1 |
+| mobile | x4 | 27.42 (25.95) | 2217 / 35 / 448 | 161 | 17.5 (21.7) |
+| mobile | **adaptive** | **28.00** (27.44) | 1886 / 130 / 684 | 227 | 11.2 (13.6) |
+
+- **Adaptive is still best on both profiles**: +1.5 dB over the best fixed mode on
+  broadband and +0.6 dB on mobile (earlier model: +1.9 and +0.9). Per clip it is best
+  in 3 of 6 runs and within 0.3 dB of the best in 2 more. It loses clearly only on
+  LjOrDJOjSMg over mobile, to x4 only (27.40 vs 25.20 dB), as with the earlier model.
+- **Real-network runs vary much more than the model does.** Direct delivery uses no
+  model, yet moved by 0.3–0.5 dB between the two sets, and x2 and x4 by 0.3–1.5 dB:
+  TCP loss recovery and jitter differ from run to run. The changes against the
+  earlier model are within that spread.
+- The model's GPU time falls by 18–28%, as on the emulated link.
