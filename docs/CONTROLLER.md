@@ -131,40 +131,42 @@ Variants that failed and were removed:
 ## Measured rate and quality
 
 `scripts/measure_rate_quality.py` on the 18 test clips (4 s each, full 720p frames,
-causal, third design, 32 channels), against the 720p reference. Table in
+causal, final model without state, 32 channels), against the 720p reference. Table in
 `configs/rate_quality.json`; the controller reads it.
 
 | Rung | kbit/s | PSNR | | Rung | kbit/s | PSNR (exit 1 / 3) |
 |---|---:|---:|---|---|---:|---:|
-| direct@18 | 5088 | 41.16 | | x2@18 | 1743 | 36.86 / 36.95 |
-| direct@23 | 2614 | 39.53 | | x2@23 | 884 | 35.62 / 35.76 |
-| direct@28 | 1340 | 37.49 | | x2@28 | 440 | 34.01 / 34.17 |
-| direct@33 | 710 | 35.24 | | x2@33 | 227 | 32.11 / 32.26 |
-| direct@38 | 402 | 32.78 | | x4@18 | 582 | 32.94 / 33.11 |
-| direct@43 | 246 | 30.22 | | x4@23 | 305 | 32.06 / 32.28 |
-| | | | | x4@28 | 155 | 30.80 / 30.96 |
-| | | | | x4@33 | 80 | 29.26 / 29.36 |
+| direct@18 | 5088 | 41.16 | | x2@18 | 1743 | 36.87 / 36.90 |
+| direct@23 | 2614 | 39.53 | | x2@23 | 884 | 35.68 / 35.72 |
+| direct@28 | 1340 | 37.49 | | x2@28 | 439 | 34.09 / 34.14 |
+| direct@33 | 710 | 35.24 | | x2@33 | 227 | 32.17 / 32.24 |
+| direct@38 | 402 | 32.78 | | x4@18 | 582 | 32.88 / 33.08 |
+| direct@43 | 246 | 30.22 | | x4@23 | 305 | 32.02 / 32.23 |
+| | | | | x4@28 | 155 | 30.73 / 30.95 |
+| | | | | x4@33 | 80 | 29.18 / 29.32 |
 
 BD-rate against direct delivery (negative: fewer bits for the same PSNR), mean of the
 per-clip values:
 
 | | UpStreamVSR, deepest exit | UpStreamVSR, first exit | Bicubic |
 |---|---:|---:|---:|
-| x2 | **-4.4%** (18 clips) | -0.1% | +18.7% |
-| x4 | **-31.3%** (16 clips) | -28.4% | -21.4% (12 clips) |
+| x2 | **+0.4%** (17 clips) | -2.8% (18 clips) | +18.7% |
+| x4 | **-32.3%** (16 clips) | -26.8% | -21.4% (12 clips) |
 
 Clips are left out where the curves do not overlap in PSNR. On the mean curves: x2
--10.0%, x4 -29.6%, bicubic x2 +9.7%, bicubic x4 +7.6%.
+-9.2%, x4 -28.7%, bicubic x2 +9.7%, bicubic x4 +7.6%; the whole ladder against direct
+alone, -11.3%. (The earlier model with state: x2 -4.4%, x4 -31.3% per clip.)
 
 What this means for the ladder:
 
-- **Below about 1 Mbit/s an upscaled rung wins** at every rate: x4@33 at 80 kbit/s,
-  x4@28, then x2@33 (32.26 dB at 227 kbit/s, against direct@43's 30.22 at 246), x2@28
-  (34.17 at 440 against direct@38's 32.78 at 402) and x2@23.
-- **Above about 1 Mbit/s direct wins**: direct@28 (37.49 at 1340) beats x2@18 (36.95
+- **Below about 0.7–1 Mbit/s an upscaled rung wins** at every rate: x4@33 at 80 kbit/s,
+  x4@28, then x2@33 (32.24 dB at 227 kbit/s, against direct@43's 30.22 at 246), x2@28
+  (34.14 at 439 against direct@38's 32.78 at 402) and x2@23.
+- **Above about 1 Mbit/s direct wins**: direct@28 (37.49 at 1340) beats x2@18 (36.90
   at 1743). x2 and x4 are capped by what 360p and 180p can hold.
-- The model is what makes x2 worth having: bicubic x2 needs 19% more bits than direct,
-  UpStreamVSR x2 4% fewer. At x4 the model adds 10 points of BD-rate over bicubic.
+- The model is what makes x2 worth having: bicubic x2 needs 19% more bits than direct
+  (per clip), UpStreamVSR x2 about the same as direct (+0.4% per clip, −9.2% on the
+  mean curves). At x4 the model adds 11 points of BD-rate over bicubic.
 - x2@18 and x4@18 are never on the efficient frontier; the ladder could drop them.
 
 These are averages: per clip, x2's BD-rate ranges from about -77% to +106%, so which

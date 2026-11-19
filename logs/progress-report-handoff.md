@@ -1,5 +1,12 @@
 # BTP VSR progress-report handoff — 2026-10-15
 
+> **Superseded (October 2026 progress presentation).** This handoff covers the
+> earlier study: off-the-shelf NanoVSR, bicubic and direct delivery over the first
+> MPEG-TS pipeline (`server/`, `client/`). Its numbers do not describe the final
+> system. For the final model, live pipeline and results, see the top-level
+> [README](../README.md) and [docs/REPORT.md](../docs/REPORT.md).
+
+
 Status: evidence and presentation assets consolidated. Existing focused comparison is complete. The new sustained NanoVSR test **failed and stopped early**, as specified; it is not a five-minute stability pass. This is a report-writing handoff, not the academic report.
 
 ## Objective and evidence-based outcome

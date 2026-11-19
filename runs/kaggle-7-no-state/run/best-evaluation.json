@@ -1,0 +1,58 @@
+{
+  "iteration": 70000,
+  "trained_with_state": false,
+  "val": {
+    "windows": 207,
+    "x2": {
+      "bilinear": 30.691,
+      "bilinear_temporal": 35.748,
+      "bicubic": 31.209,
+      "bicubic_temporal": 35.77,
+      "blocks3": 31.932,
+      "blocks3_temporal": 36.048,
+      "blocks6": 32.033,
+      "blocks6_temporal": 36.113,
+      "blocks9": 32.056,
+      "blocks9_temporal": 36.136
+    },
+    "x4": {
+      "bilinear": 27.022,
+      "bilinear_temporal": 33.587,
+      "bicubic": 27.43,
+      "bicubic_temporal": 33.553,
+      "blocks3": 28.312,
+      "blocks3_temporal": 33.844,
+      "blocks6": 28.44,
+      "blocks6_temporal": 33.879,
+      "blocks9": 28.466,
+      "blocks9_temporal": 33.894
+    }
+  },
+  "test": {
+    "windows": 64,
+    "x2": {
+      "bilinear": 31.37,
+      "bilinear_temporal": 37.33,
+      "bicubic": 31.856,
+      "bicubic_temporal": 37.315,
+      "blocks3": 32.621,
+      "blocks3_temporal": 37.657,
+      "blocks6": 32.663,
+      "blocks6_temporal": 37.72,
+      "blocks9": 32.665,
+      "blocks9_temporal": 37.741
+    },
+    "x4": {
+      "bilinear": 27.567,
+      "bilinear_temporal": 35.079,
+      "bicubic": 27.979,
+      "bicubic_temporal": 34.999,
+      "blocks3": 28.917,
+      "blocks3_temporal": 35.462,
+      "blocks6": 29.073,
+      "blocks6_temporal": 35.509,
+      "blocks9": 29.095,
+      "blocks9_temporal": 35.519
+    }
+  }
+}

@@ -1,95 +1,145 @@
-# Video Resolution Enhancement for Streaming Applications
+# UpStream: adaptive live video super-resolution for streaming
 
-The objective is a complete streaming pipeline with practical trade-offs between
-bandwidth, visual quality, latency, and client compute. Neither 320×180→1280×720
-nor x4 scaling is a final requirement. Earlier x4 evaluations are model-specific
-baselines. Resolution, compression, playback size, and reconstruction should be
-compared jointly. NanoVSR remains a native x4 model; CDA authentic-input work is
-pending and is outside the current milestone.
+UpStream streams video at low resolution and upscales it on the viewer's GPU in real
+time. For every frame, a controller chooses how to deliver it:
 
-The current milestone implements paced, video-only localhost delivery:
-source → live FFmpeg H.264 encoding → TCP/MPEG-TS → live FFmpeg decoding →
-optional reconstruction/resizing → timed OpenCV playback. See
-[the measured milestone report](logs/streaming-milestone-2026-10-15.md).
+- **direct**: send 720p;
+- **×2**: send 360p and upscale it;
+- **×4**: send 180p and upscale it.
 
-From this project directory, in kitty:
+The controller also picks the compression level, so the stream balances four things
+that pull against each other: **latency, client GPU resources, picture quality and
+bandwidth**.
 
-```bash
-.venv/bin/python scripts/run_streaming_demo.py --mode bicubic --output results/my-playback
+The upscaler is **UpStreamVSR**, a 217k-parameter super-resolution network designed
+for this pipeline and trained on [StreamSR](https://github.com/EvgeneyBogatyrev/EfRLFN)
+(real compressed YouTube video). Its features:
+
+- conditioning on the encoder's compression level;
+- anytime early exits, so the depth fits each frame's deadline;
+- one network for ×2 and ×4.
+
+B.Tech project. The full write-up is in [docs/REPORT.md](docs/REPORT.md).
+
+![Rate-quality curves](docs/figures/rate_quality.png)
+
+## Results
+
+All results are measured on an NVIDIA RTX 3050 Laptop GPU (4 GB).
+
+| | |
+|---|---|
+| Against four recent published models (EfRLFN, SPAN, NanoVSR, CDA-VSR), offline, 18 clips | Best PSNR at all 8 ×2/×4 bitrates. At ×4: **33.09 dB in 5.0 ms** per frame, vs 32.62 dB in 41.8 ms for CDA-VSR, the closest. Least flicker of all. |
+| The same models in the live pipeline, same controller | **+0.95 to +1.33 dB** viewer PSNR, at 55–62% of their GPU power. UpStreamVSR is the only one fast enough for ×2 live. |
+| Adaptive vs fixed delivery over real TCP (tc netem) | Adaptive beats direct-only, ×2-only and ×4-only by **+1.5 dB** (broadband) and **+0.6 dB** (mobile). |
+| Bandwidth | For the same PSNR, ×4 + UpStreamVSR needs about 30% fewer bits than direct 720p (BD-rate −28.7%). |
+| Stability | A 5-minute live run held 30 fps, with a flat 155 ms median display latency. |
+
+"Viewer PSNR" scores every display slot against the 720p original. A late or skipped
+frame counts as the previous frame held on screen, so latency problems show up as
+lost quality.
+
+![Speed and quality at x4](docs/figures/speed_quality.png)
+![Live comparison](docs/figures/live_models.png)
+
+## How it works
+
+```
+source ─► ffmpeg/x264, all three renditions live ─┬─ 720p  direct ─┐
+          (zerolatency, keyframe every 30 frames)  ├─ 360p  x2     ─┼─► server sends the requested
+                                                   └─ 180p  x4     ─┘   rung, switching on a keyframe
+                                                                              │ TCP
+client:  receive ─► decode (PyAV) ─► upscale on the GPU (exit per frame) ─► display on time
+            ▲                                                                 │
+            └──── trade-off controller: rung (rendition + CRF) from link estimate,
+                  rate-quality table and GPU time budget; backlog guard ◄──────┘
 ```
 
-The output directory must be new. Change `--mode` to `direct` or `nanovsr` for
-the other comparisons. NanoVSR requires working CUDA access. The existing
-`.venv` suffices; do not reinstall dependencies. Escape cancels playback and
-records an explicit cancellation error. Runs end automatically after the clip.
+- **Server** (`live/server.py`): encodes 13 rungs live. Direct uses CRF 23–43; ×2 and
+  ×4 use CRF 18/23/28/33. The encoder settings are identical to the training data.
+- **Controller** (`live/controller.py`): picks the rung with the best predicted
+  quality that fits the estimated link capacity and the GPU budget (20 ms per frame).
+  A backlog guard skips ahead when frames queue behind a bandwidth drop.
+- **Depth policy** (`live/policy.py`): per frame, it picks the deepest model exit that
+  still meets the frame's display deadline.
+- **Model** (`upstream_vsr/model.py`): built from reparameterizable conv blocks that
+  fuse to plain 3x3 convs, with a pixel-shuffle head. It has per-scale BatchNorm and
+  CRF conditioning.
+- **The model works per frame.** A recurrent memory was tried and ablated: it added no
+  measurable quality, cost 65% more time and added flicker, so it was removed
+  ([docs/ABLATION.md](docs/ABLATION.md)).
 
-Use `--headless` for transport/processing checks without opening a window.
-Use `--config configs/streaming-tail.json` for 91 frames including a partial
-NanoVSR chunk. Copy/edit `configs/streaming-smoke.json` for transmission size,
-common playback size, CRF, encoder preset, chunk size, queue capacity, playout
-delay, and late-frame deadline. The included source is **synthetic**.
+![Controller timeline](docs/figures/controller_timeline.png)
 
-For independent terminals (same host and configuration):
+## Run it
 
-```bash
-.venv/bin/python server/streaming_server.py --mode bicubic --report results/manual-server.json
-.venv/bin/python client/streaming_client.py --mode bicubic --report results/manual-client.json
-```
+Requirements:
 
-Both bind/connect only to 127.0.0.1:8765 by default; choose matching `--port`
-values to avoid conflicts. This is a trusted-localhost research demo, not a
-remote streaming service. It has no audio, adaptive bitrate, seeking, reconnect,
-TLS, or cross-host clock synchronization. Server and client require matching
-configs and mode. JSON reports, FFmpeg logs, exact launch/codec argv and the
-received TS bitstream are retained. The bitstream capture is diagnostic;
-decoding and presentation occur continuously before EOS, not after download.
+- Python 3.12, PyTorch with CUDA, PyAV and OpenCV (for `--display`); torchvision only
+  for the CDA-VSR baseline;
+- FFmpeg with libx264.
 
-Reproduce headless comparisons and overload (choose a fresh base directory):
+The final weights are included: `runs/kaggle-7-no-state/run/best-calibrated.pt`, 0.7 MB.
 
 ```bash
-.venv/bin/python scripts/run_streaming_demo.py --headless --mode direct --output results/recheck/final-direct
-.venv/bin/python scripts/run_streaming_demo.py --headless --mode bicubic --output results/recheck/final-bicubic
-.venv/bin/python scripts/run_streaming_demo.py --headless --mode nanovsr --output results/recheck/final-nanovsr
-.venv/bin/python scripts/run_streaming_demo.py --headless --mode bicubic --processing-delay 0.07 --output results/recheck/overload
-.venv/bin/python scripts/verify_streaming.py results/recheck --failure-checks
+pip install -r requirements-train.txt opencv-python
+
+# terminal 1: stream a clip over an emulated link that drops from 2.5 to 0.5 Mbit/s
+python live/server.py data/test-clips/NRqG3AEOVGg@1440.mp4 --crfs 18 23 28 33 \
+    --direct-crfs 23 28 33 38 43 --start x4@28 --link 0:2500,10:500,20:1500
+
+# terminal 2: receive, upscale and play, with the controller choosing the rungs
+python live/client.py --checkpoint runs/kaggle-7-no-state/run/best-calibrated.pt --controller \
+    --half --playout-delay 0.15 --display --compare
 ```
 
-See the report for buffering, timestamp, timing, and display-count definitions.
+`--compare` shows bicubic on the left and UpStreamVSR on the right. The 18 test clips in
+`data/test-clips/` are the `@1440` files of the StreamSR test archive
+(`subjective-set.tar.gz`, linked from the EfRLFN README). Any MP4 of 720p or larger works.
 
-The focused natural-video study is documented in
-[the natural-video milestone report](logs/natural-streaming-milestone-2026-10-15.md).
-Source credits/licenses are in [ATTRIBUTION.md](videos/natural-source/ATTRIBUTION.md).
-It uses 640×360 references/playback, 320×180 delivery, and unchanged NanoVSR
-native1280×720 reconstruction followed by resizing. Offline quality scores
-cover every reconstructed frame; timed playback completeness is separate.
+Reproducing the results:
 
-Launch the saved road CRF23 asset with explicit NanoVSR warmup:
+| What | Command | Write-up |
+|---|---|---|
+| Rate-quality table | `python scripts/measure_rate_quality.py --checkpoint <ckpt>` | [CONTROLLER.md](docs/CONTROLLER.md) |
+| Live comparison of delivery modes | `python scripts/compare_modes.py <clips> --half` | [COMPARISON.md](docs/COMPARISON.md) |
+| Real-network comparison | `sudo bash scripts/run_netem.sh full` | [COMPARISON.md](docs/COMPARISON.md) |
+| Published models, offline | `python scripts/benchmark_baselines.py --half` | [BASELINES.md](docs/BASELINES.md) |
+| Ablations | `python scripts/compare_modes.py <clips> --modes adaptive adaptive-bicubic ...` | [ABLATION.md](docs/ABLATION.md) |
+| Training (Kaggle) | `kaggle/1_prepare_data.ipynb`, then `kaggle/2b_train_no_state.ipynb` | [MODEL.md](docs/MODEL.md) |
+| Figures | `python3 scripts/plot_report.py` | |
+| Tests | `python -m pytest tests` (66 tests) | |
 
-```bash
-.venv/bin/python scripts/run_streaming_demo.py --mode nanovsr --config configs/natural-road-nanovsr.json --output results/my-natural-playback
-```
+The published models' code and weights are not redistributed. `upstream_vsr/baselines.py`
+loads them from `$UPSTREAM_EXTERNAL` (default `~/Github/btp-vsr/external`).
 
-This replays the saved bitstream over localhost. Set `verification: true` in a
-copied configuration to enable bitstream capture, frame hashing and timestamp
-checks. Keep it false for timing. `warmup_chunks: 0` records cold model operation;
-`3` performs three warmup chunks before scheduling and reports that cost. Set
-`warmup_pipeline: true` to warm the exact transfer/model/conversion/resize path;
-false retains the narrower model-only warmup experiment.
+## Repository layout
 
-The completed study found NanoVSR quality gains over bicubic on road/waterfall
-and a loss on flowers. At the selected near-matched rates, direct delivery won
-on quality and client cost. Its road point passed three 150 ms buffer runs;
-the current NanoVSR GUI path showed latency drift despite fitting in VRAM.
-See the report and CSVs for the measured scope and limitations.
+| Path | Contents |
+|---|---|
+| `upstream_vsr/` | model, codec and motion-vector decoding, encoder settings, training data, published-model re-implementations |
+| `live/` | server, client, trade-off controller, depth policy, backlog guard, emulated link, tc-netem harness |
+| `scripts/` | data preparation, training, calibration, benchmarks, comparisons, plots |
+| `kaggle/` | training notebooks |
+| `configs/rate_quality.json` | the controller's measured rate-quality table |
+| `docs/` | report and detailed write-ups |
+| `tests/` | unit tests |
+| `server/`, `client/`, `presentation_assets/`, `logs/` | the October 2026 study (off-the-shelf NanoVSR over MPEG-TS), superseded |
 
-## Progress presentation handoff
+## Limitations
 
-See [the report-writing handoff](logs/progress-report-handoff.md) and [presentation assets / fish launch commands](presentation_assets/REPRODUCE.md). The existing comparison is complete. The additional sustained NanoVSR trial stopped at 80 seconds after playback drops exceeded the guard threshold; it is a recorded failure, not a five-minute pass. Direct delivery is the reliable live-demo fallback; a clearly labelled offline comparison backup is provided.
+- One laptop GPU.
+- Live comparisons use 3 clips × 30 s; offline comparisons use 18 clips.
+- The networks are emulated, or shaped with tc netem on one machine.
+- Quality is measured in PSNR only.
+- The published models were adapted to run causally, one frame at a time
+  ([docs/BASELINES.md](docs/BASELINES.md)).
 
-## Repository distribution
+## Credits
 
-See [repository contents and setup notes](docs/REPOSITORY_CONTENTS.md) for upstream model revisions, excluded local assets, dependency records, and fresh-clone requirements. Source attribution and compact measured results are included; pretrained checkpoints, environments and large raw outputs remain local.
+- StreamSR dataset and EfRLFN: Bogatyrev et al.
+- SPAN: Wan et al.
+- NanoVSR: Pawlicki et al.
+- CDA-VSR: sspBIT.
 
-## New model: UpStreamVSR
-
-Project goals and milestones are in [docs/GOALS.md](docs/GOALS.md). The model design, current measurements, open risks and cloud training commands are in [docs/MODEL.md](docs/MODEL.md). The model is not yet trained on the full dataset.
+Their code and weights are used under their own licenses and are not included here.

@@ -1,5 +1,11 @@
 # Repository contents and local setup
 
+> **Superseded (October 2026 progress presentation).** This page describes the repository as it was for the
+> earlier study: off-the-shelf NanoVSR, bicubic and direct delivery over the first
+> MPEG-TS pipeline (`server/`, `client/`). Its numbers do not describe the final
+> system. For the final model, live pipeline and results, see the top-level
+> [README](../README.md) and [docs/REPORT.md](../docs/REPORT.md).
+
 This repository contains the BTP streaming implementation, reproducible experiment
 scripts/configurations, milestone reports, source attribution, compact measured
 CSV/JSON evidence, report figures/crops and the labelled offline comparison backup.

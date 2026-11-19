@@ -52,4 +52,11 @@ __pycache__/
 
 # Prepared training data and training runs
 /data/
-/runs/
+/runs/*
+# The final model is small (0.7 MB) and kept so a fresh clone can run the live system.
+!/runs/kaggle-7-no-state/
+/runs/kaggle-7-no-state/*
+!/runs/kaggle-7-no-state/run/
+/runs/kaggle-7-no-state/run/*
+!/runs/kaggle-7-no-state/run/best-calibrated.pt
+!/runs/kaggle-7-no-state/run/best-evaluation.json

@@ -1,5 +1,11 @@
 # Progress presentation assets
 
+> **Superseded (October 2026 progress presentation).** This folder documents the
+> earlier study: off-the-shelf NanoVSR, bicubic and direct delivery over the first
+> MPEG-TS pipeline (`server/`, `client/`). Its numbers do not describe the final
+> system. For the final model, live pipeline and results, see the top-level
+> [README](../README.md) and [docs/REPORT.md](../docs/REPORT.md).
+
 Start with [the handoff](../logs/progress-report-handoff.md) and [launch commands](REPRODUCE.md).
 
 - `data/comparison.csv`: concise 26-column table, one row per clip/mode/startup/buffer configuration; actual TS bytes/kbps, whole-stream PSNR/SSIM, three-run ranges and means, processing/submission rates, latency, drops and GPU allocation. Units appear in column names. No confidence intervals.
