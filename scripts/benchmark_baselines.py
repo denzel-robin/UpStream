@@ -9,7 +9,7 @@ does), decoded with motion vectors, and upscaled one frame at a time, causally, 
   bicubic
   efrlfn, span, nanovsr, cdavsr   (upstream_vsr/baselines.py; nanovsr and cdavsr are x4 only)
 
-Per model and rung: PSNR against the 720p reference, temporal PSNR (frame-to-frame
+Per model and rung: PSNR, VMAF and LPIPS (upstream_vsr/metrics.py) against the 720p reference, temporal PSNR (frame-to-frame
 changes; higher is steadier), and the per-frame time on this GPU with a CUDA sync after
 every frame, as the live client measures it. Also parameters and peak GPU memory.
 
@@ -37,6 +37,7 @@ from prepare_streamsr import probe  # noqa: E402
 from upstream_vsr.baselines import NAMES, Baseline  # noqa: E402
 from upstream_vsr.codec import decode_with_motion  # noqa: E402
 from upstream_vsr.encoding import frame_step  # noqa: E402
+from upstream_vsr.metrics import Lpips, vmaf  # noqa: E402
 from upstream_vsr.model import crf_to_quality  # noqa: E402
 
 
@@ -73,7 +74,7 @@ class Bicubic:
 
 
 @torch.inference_mode()
-def run(model, frames, gt, scale: int, device) -> dict:
+def run(model, frames, gt, scale: int, device, lpips=None, lpips_every: int = 4) -> dict:
     lr = to_tensor([f.rgb for f in frames], device)
     mv = torch.from_numpy(np.stack([f.mv for f in frames])).to(device).permute(0, 3, 1, 2)
     model.reset()
@@ -87,8 +88,16 @@ def run(model, frames, gt, scale: int, device) -> dict:
         times.append((time.perf_counter() - begin) * 1000)
         values.append(frame_psnr(out, gt[t]))
         outputs.append(out)
-    return {'psnr': float(np.mean(values)), 'temporal': temporal(outputs, gt),
-            'ms_median': float(np.median(times[5:])), 'ms_p95': float(np.percentile(times[5:], 95))}
+    result = {'psnr': float(np.mean(values)), 'temporal': temporal(outputs, gt),
+              'ms_median': float(np.median(times[5:])), 'ms_p95': float(np.percentile(times[5:], 95))}
+    if lpips is not None:  # after the timed loop, so it does not affect the times
+        result['lpips'] = float(np.mean([lpips(outputs[t][0], gt[t].float() / 255)
+                                         for t in range(0, len(outputs), lpips_every)]))
+        height, width = outputs[0].shape[-2:]
+        as_rgb = lambda x: x.reshape(3, height, width).permute(1, 2, 0).mul(255).round().byte().cpu().numpy()  # noqa: E731
+        result['vmaf'] = vmaf((as_rgb(o) for o in outputs), (as_rgb(g.float() / 255) for g in gt[:len(outputs)]),
+                              width, height)['vmaf']
+    return result
 
 
 def main() -> None:
@@ -102,8 +111,11 @@ def main() -> None:
     parser.add_argument('--models', nargs='+', default=['upstream', 'bicubic', *NAMES])
     parser.add_argument('--half', action='store_true')
     parser.add_argument('--output', type=Path, default=ROOT / 'results/baselines/offline.json')
+    parser.add_argument('--no-perceptual', dest='perceptual', action='store_false',
+                        help='PSNR only: no VMAF (every frame) or LPIPS (every 4th frame)')
     args = parser.parse_args()
     device = torch.device('cuda')
+    lpips = Lpips(device) if args.perceptual else None
 
     models, memory = {}, {}
     for name in args.models:
@@ -137,7 +149,7 @@ def main() -> None:
                     if name in ('upstream', 'with-state'):
                         model.crf = crf
                     torch.cuda.reset_peak_memory_stats()
-                    entry[name] = run(model, frames, gt, scale, device)
+                    entry[name] = run(model, frames, gt, scale, device, lpips)
                     entry[name]['peak_mib'] = torch.cuda.max_memory_allocated() / 2 ** 20
                 rungs[rung] = entry
         clips.append({'clip': source.name, 'rungs': rungs})
@@ -150,7 +162,8 @@ def main() -> None:
         for name in models:
             if name in entries[0]:
                 summary[rung][name] = {k: float(np.mean([e[name][k] for e in entries]))
-                                       for k in ('psnr', 'temporal', 'ms_median', 'ms_p95', 'peak_mib')}
+                                       for k in ('psnr', 'temporal', 'ms_median', 'ms_p95', 'peak_mib', 'lpips', 'vmaf')
+                                       if k in entries[0][name]}
     report = {'checkpoint': str(args.checkpoint), 'half': args.half, 'seconds': args.seconds, 'clips': len(clips),
               'gpu': torch.cuda.get_device_name(), 'parameters': {n: m.parameters for n, m in models.items()},
               'memory': memory, 'summary': summary, 'per_clip': clips}
@@ -159,8 +172,9 @@ def main() -> None:
     names = list(models)
     print(f"{'rung':8s} {'kbps':>6s} " + ' '.join(f'{n:>16s}' for n in names))
     for rung, entry in summary.items():
-        cells = [f"{entry[n]['psnr']:6.2f} {entry[n]['ms_median']:5.1f}ms" if n in entry else ' ' * 16 for n in names]
-        print(f"{rung:8s} {entry['kbps']:6.0f} " + ' '.join(f'{c:>16s}' for c in cells))
+        cells = [f"{entry[n]['psnr']:6.2f} {entry[n].get('vmaf', 0):4.1f} {entry[n].get('lpips', 0):.3f} "
+                 f"{entry[n]['ms_median']:5.1f}ms" if n in entry else ' ' * 28 for n in names]
+        print(f"{rung:8s} {entry['kbps']:6.0f} " + ' '.join(f'{c:>28s}' for c in cells))
 
 
 if __name__ == '__main__':

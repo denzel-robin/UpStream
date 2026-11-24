@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Run the four-mode comparison over a real TCP path shaped by tc netem (live/netem.py).
+# Run the delivery-mode comparison over a real TCP path shaped by tc netem (live/netem.py).
 # Needs root for the network namespace and tc; the model, server and client run as the
 # invoking user. Usage (from any shell, including fish):
 #
 #   sudo bash scripts/run_netem.sh smoke      # 8 s, one clip, adaptive only: checks the set-up
 #   sudo bash scripts/run_netem.sh full       # 3 clips x 4 modes x 2 path profiles, about 25 min
+#   sudo bash scripts/run_netem.sh multi      # 10 clips x 6 modes (with RobustMPC) x 2 profiles, about 3 h;
+#                                             # resumable: run it again after an interruption
 #
 # Path profiles (one-way delay and jitter in ms, loss in %, router queue in packets):
 #   broadband  delay=20,jitter=5,loss=0.1,limit=300    (about 40 ms round trip)
@@ -19,6 +21,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 PYTHON="${UPSTREAM_PYTHON:-/home/ibexe/Github/btp-vsr/.venv/bin/python}"
 export PYTHONPATH="$ROOT:$ROOT/.tools/py"
+# LPIPS weights from the invoking user's cache, not root's
+export TORCH_HOME="${TORCH_HOME:-$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)/.cache/torch}"
 CLIPS=(data/test-clips/NRqG3AEOVGg@1440.mp4 data/test-clips/LjOrDJOjSMg@1440.mp4 data/test-clips/vT7XBbyKssI@1440.mp4)
 
 case "${1:-smoke}" in
@@ -32,8 +36,16 @@ case "${1:-smoke}" in
         "$PYTHON" scripts/compare_modes.py "${CLIPS[@]}" --half --netem --port 8900 \
             --path delay=40,jitter=15,loss=1,limit=300 --out results/netem-mobile
         ;;
+    multi)
+        MULTI=($(ls data/test-clips/*.mp4 | head -10))
+        MODES=(direct x2 x4 adaptive mpc mpc-direct)
+        "$PYTHON" scripts/compare_modes.py "${MULTI[@]}" --modes "${MODES[@]}" --half --netem --resume \
+            --path delay=20,jitter=5,loss=0.1,limit=300 --out results/multiclip-netem-broadband
+        "$PYTHON" scripts/compare_modes.py "${MULTI[@]}" --modes "${MODES[@]}" --half --netem --resume --port 8900 \
+            --path delay=40,jitter=15,loss=1,limit=300 --out results/multiclip-netem-mobile
+        ;;
     *)
-        echo "usage: sudo bash scripts/run_netem.sh smoke|full" >&2
+        echo "usage: sudo bash scripts/run_netem.sh smoke|full|multi" >&2
         exit 1
         ;;
 esac

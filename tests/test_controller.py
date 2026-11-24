@@ -7,7 +7,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from live.controller import DeliveryMonitor, TradeoffController  # noqa: E402
+from live.controller import DeliveryMonitor, MpcController, TradeoffController  # noqa: E402
 from live.link import EmulatedLink, parse_link  # noqa: E402
 from live.policy import DepthPolicy  # noqa: E402
 from live.simulate import simulate  # noqa: E402
@@ -167,3 +167,37 @@ def test_netem_path_conditions_build_tc_arguments():
     assert 'rate' not in PathConditions(jitter_ms=0, loss_pct=0).netem(None)
     with pytest.raises(ValueError):
         PathConditions.parse('latency=20')
+
+
+def test_mpc_prediction_is_a_discounted_harmonic_mean():
+    controller = MpcController(TABLE, LADDER, 1 / 30, 0.1, policy=policy_with(FAST))
+    controller.samples.extend([1000, 500])
+    controller.errors.extend([0.1, 0.25])
+    assert controller.predict() == pytest.approx((2 / (1 / 1000 + 1 / 500)) / 1.25)
+
+
+def test_mpc_plan_takes_the_best_rung_the_throughput_sustains():
+    controller = MpcController(TABLE, LADDER, 1 / 30, 0.1, policy=policy_with(FAST))
+    controller.start('x4@28', 0.0)
+    options = {n: controller.quality(n) for n in LADDER}
+    assert controller.plan(options, 2000, 0.0)[0] == 'x2@23'  # 1580 kbit/s fits, direct@28 does not
+    assert controller.plan(options, 600, 0.0)[0] == 'x4@23'
+
+
+def test_mpc_decides_once_per_group_of_pictures():
+    controller = MpcController(TABLE, LADDER, 1 / 30, 0.1, policy=policy_with(FAST))
+    controller.start('x4@28', 0.0)
+    decisions = 0
+    for i in range(90):
+        t = i / 30
+        size = 8000 if i % 30 == 0 else 2000
+        controller.observe_packet(t, t + 0.005 + size * 8 / 2_000_000, size, i % 30 == 0)
+        decisions += controller.decide(t + 0.01) is not None
+    assert decisions == 1 and controller.current == 'x2@23'
+
+
+def test_simulated_mpc_follows_a_drop():
+    result = simulate(TABLE, LADDER, parse_link('0:3000,10:700,20:1800'), 30, 'x4@28', abr='mpc')
+    rungs = {second: [f['rung'] for f in result['frames'] if second <= f['sent'] < second + 1][-1]
+             for second in (8, 18)}
+    assert TABLE[rungs[18]]['kbps'] < 700 < TABLE[rungs[8]]['kbps']

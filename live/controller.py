@@ -345,3 +345,105 @@ class TradeoffController:
     def start(self, name: str, now: float) -> None:
         """The rung the server starts on."""
         self.current, self.changed_at = name, now
+
+
+class MpcController(TradeoffController):
+    """RobustMPC (Yin et al., SIGCOMM 2015), adapted to this live stream: a standard
+    model-predictive ABR baseline, for comparison with the trade-off controller.
+
+    It sees the same inputs (per-packet link measurements, rung rates, the rate-quality
+    table and which rungs the GPU can run, at which exit) and differs only in the rule:
+
+      throughput  one sample per group of pictures, the measured capacity; the
+                  prediction is the harmonic mean of the last `history` samples,
+                  divided by 1 + the largest relative error of recent predictions
+      plan        over the next `horizon` groups, every sequence of rungs, scored by
+                  QoE = sum quality - rebuffer_weight * rebuffer seconds
+                        - switch_weight * |quality change|
+                  where quality is predicted PSNR and the rebuffer comes from a
+                  queue model: each group adds (rate / throughput - 1) x its duration
+                  to the queue, and what exceeds the playout budget stalls
+      decide      the first rung of the best plan, once per group, at a keyframe
+
+    The weights follow the paper's linear QoE (switch weight 1, rebuffer weight the
+    best quality on offer), with PSNR in dB in place of bitrate in Mbit/s. It does not
+    ask the server to skip ahead; the server's backlog guard still applies.
+    """
+
+    def __init__(self, *args, horizon: int = 5, history: int = 5, switch_weight: float = 1.0,
+                 rebuffer_weight: float | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.horizon, self.history = horizon, history
+        self.switch_weight, self.rebuffer_weight = switch_weight, rebuffer_weight
+        self.samples: deque[float] = deque(maxlen=history)
+        self.errors: deque[float] = deque(maxlen=history)
+        self.predicted: float | None = None
+        self.last_key_at = float('-inf')
+        self.group_s = self.frame_interval * self.keyint
+        self._pending_key = False
+
+    def observe_packet(self, sent: float, arrived: float, size: int, keyframe: bool) -> None:
+        super().observe_packet(sent, arrived, size, keyframe)
+        if keyframe:
+            self._pending_key = True
+
+    def predict(self) -> float | None:
+        if not self.samples:
+            return None
+        harmonic = len(self.samples) / sum(1 / s for s in self.samples)
+        return harmonic / (1 + max(self.errors, default=0.0))
+
+    def plan(self, options: dict[str, float], throughput: float, queue_s: float) -> tuple[str, float]:
+        """The first rung of the best sequence, and that sequence's QoE."""
+        names = sorted(options, key=self.rate)
+        weight = self.rebuffer_weight if self.rebuffer_weight is not None else max(options.values())
+        current_q = options.get(self.current, self.quality(self.current) if self.current else None)
+        best, best_first = float('-inf'), names[0]
+
+        def search(depth: int, queue: float, previous_q: float | None, total: float, first: str | None) -> None:
+            nonlocal best, best_first
+            if total + (self.horizon - depth) * max(options.values()) <= best:
+                return  # no continuation can beat the best plan so far
+            if depth == self.horizon:
+                best, best_first = total, first
+                return
+            for name in names:
+                q = options[name]
+                queue_next = max(queue + (self.rate(name) / throughput - 1) * self.group_s, 0.0)
+                stall = max(queue_next - self.latency_budget_s, 0.0)
+                change = abs(q - previous_q) if previous_q is not None else 0.0
+                search(depth + 1, min(queue_next, self.latency_budget_s), q,
+                       total + q - weight * stall - self.switch_weight * change, first or name)
+
+        search(0, queue_s, current_q, 0.0, None)
+        return best_first, best
+
+    def decide(self, now: float) -> tuple[str, str, bool] | None:
+        self._update_capacity()
+        if not self._pending_key:
+            return None
+        self._pending_key = False  # one decision per group of pictures
+        measured = self.capacity or self.monitor.busy_capacity or self.monitor.delivery_kbps
+        if measured is None:
+            return None
+        if self.predicted is not None:
+            self.errors.append(abs(self.predicted - measured) / measured)
+        self.samples.append(measured)
+        throughput = self.predict()
+        self.predicted = throughput
+        runnable = {name: q for name in self.rungs if (q := self.quality(name)) is not None}
+        if not runnable:
+            runnable = {n: self.table[n]['psnr'][0] for n, r in self.rungs.items() if r.scale == 1} or \
+                       {n: self.table[n]['psnr'][0] for n in self.rungs}
+        choice, qoe = self.plan(runnable, throughput, self.monitor.standing_queue)
+        if choice == self.current:
+            return None
+        if self.rate(choice) < self.rate(self.current or choice):
+            self.down_at = now
+        self.trace.append({'t': round(now, 3), 'to': choice, 'from': self.current, 'reason': 'mpc', 'skip': False,
+                           'throughput_kbps': round(throughput, 1), 'rate_kbps': round(self.rate(choice), 1),
+                           'predicted_psnr': round(runnable[choice], 3), 'qoe': round(qoe, 2),
+                           'capacity_kbps': None if self.capacity is None else round(self.capacity, 1),
+                           'queue_ms': round(self.monitor.queue_delay * 1000, 1)})
+        self.current, self.changed_at = choice, now
+        return choice, 'mpc', False

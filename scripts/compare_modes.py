@@ -17,8 +17,8 @@ For every run the four quantities are measured, not predicted:
   latency    display latency of shown frames, late drops, skipped frames, freezes
   resources  model GPU time, exits, GPU utilisation, power and temperature
              (nvidia-smi), peak GPU memory, client CPU time
-  quality    PSNR of what the viewer saw against the 720p reference: every frame
-             slot, a skipped or late frame counted as the last shown frame held
+  quality    PSNR, VMAF and LPIPS of what the viewer saw against the 720p reference:
+             every frame slot, a skipped or late frame counted as the last shown frame held
   bandwidth  payload bitrate sent, per link phase, and its share of the link
 
 plus how many frames each rung and exit got. Writes summary.json and a Markdown
@@ -46,6 +46,7 @@ from live.link import parse_link  # noqa: E402
 from live.netem import CLIENT_IP, HOST_IP, NAMESPACE, NetemPath, PathConditions  # noqa: E402
 from upstream_vsr.codec import decode_with_motion  # noqa: E402
 from upstream_vsr.encoding import frame_step, ladder_graph  # noqa: E402
+from upstream_vsr.metrics import Lpips, vmaf  # noqa: E402
 from prepare_streamsr import probe  # noqa: E402
 
 ALL = ['direct', 'x2', 'x4']
@@ -61,6 +62,10 @@ MODES = {
     'adaptive-no-gpu-awareness': (ALL, 'x4@28', ['--no-gpu-awareness'], []),
     'adaptive-no-guard': (ALL, 'x4@28', [], ['--no-guard']),
     'x4-bicubic': (['x4'], 'x4@28', ['--upscaler', 'bicubic'], []),
+    # RobustMPC (live/controller.py MpcController): the same ladder and measurements with a
+    # standard ABR rule; mpc-direct is a conventional stream, MPC over 720p rungs only.
+    'mpc': (ALL, 'x4@28', ['--abr', 'mpc'], []),
+    'mpc-direct': (['direct'], 'direct@33', ['--abr', 'mpc'], []),
 }
 # Published models in place of UpStreamVSR (upstream_vsr/baselines.py), with the same
 # controller; it times each model, so a model without x2 or too slow for the GPU budget
@@ -93,21 +98,27 @@ def psnr(a: np.ndarray, b: np.ndarray) -> float:
     return float(10 * np.log10(255 ** 2 / max(error, 1e-10)))
 
 
-def score(client: dict, record: Path, reference, fps: float, phases: list[tuple[float, float]]) -> dict:
-    """What the viewer saw, slot by slot, against the reference."""
+def score(client: dict, record: Path, reference, fps: float, phases: list[tuple[float, float]],
+          lpips=None, reference_again=None) -> dict:
+    """What the viewer saw, slot by slot, against the reference: PSNR, and with lpips
+    (upstream_vsr.metrics.Lpips) and reference_again (a second pass over the reference
+    frames) also LPIPS and VMAF of the same held-frame sequence."""
     shape = tuple(client['record']['shape'])
     frames = np.memmap(record, dtype=np.uint8, mode='r', shape=(client['record']['frames'], *shape))
     shown = {f['index']: f['recorded'] for f in client['frames'] if not f['dropped'] and 'recorded' in f}
     total = client['end']['frames']
-    per_slot, held, current, fresh = [], [], None, []
+    per_slot, held, current, fresh, lpips_slot = [], [], None, [], []
     for i, target in zip(range(total), reference):
         if i in shown:
             current = shown[i]
         fresh.append(i in shown)
+        held.append(current)
         if current is None:  # nothing on screen yet
             per_slot.append(None)
             continue
         per_slot.append(psnr(frames[current], target))
+        if lpips is not None:
+            lpips_slot.append(lpips(frames[current], target))
     valid = [v for v in per_slot if v is not None]
     freezes, run = [], 0
     for is_fresh in fresh:
@@ -123,6 +134,14 @@ def score(client: dict, record: Path, reference, fps: float, phases: list[tuple[
               'shown_psnr': round(float(np.mean([v for v, f in zip(per_slot, fresh) if f and v is not None])), 3),
               'frozen_slots': int(sum(not f for f in fresh)), 'freeze_events': len(freezes),
               'longest_freeze_ms': round(max(freezes, default=0) / fps * 1000, 1), 'per_phase': []}
+    if lpips is not None:
+        result['viewer_lpips'] = round(float(np.mean(lpips_slot)), 4)
+    if reference_again is not None:
+        first = next(i for i, h in enumerate(held) if h is not None)
+        height, width = shape[:2]
+        scores = vmaf((frames[h] for h in held[first:]),
+                      (t for i, t in enumerate(reference_again) if first <= i < len(held)), width, height, fps)
+        result['viewer_vmaf'], result['viewer_vmaf_harmonic'] = scores['vmaf'], scores['vmaf_harmonic']
     bounds = [p[0] for p in phases] + [len(per_slot) / fps]
     for k, (begin, kbps) in enumerate(phases):
         slots = [v for i, v in enumerate(per_slot) if bounds[k] <= i / fps < bounds[k + 1] and v is not None]
@@ -291,13 +310,15 @@ def summarise(mode: str, client: dict, server: dict, quality: dict, gpu: dict, f
 
 
 def markdown(rows: list[dict]) -> str:
-    head = ('| Mode | Viewer PSNR | Shown PSNR | Latency p50/p95/max ms | Shown/late/skipped | Freeze longest ms | '
+    head = ('| Mode | Viewer PSNR | VMAF | LPIPS | Shown PSNR | Latency p50/p95/max ms | Shown/late/skipped | Freeze longest ms | '
             'kbps | Model GPU % | GPU util % | Power W | Rendition share |')
     lines = [head, '|' + '---|' * (head.count('|') - 1)]
     for r in rows:
         l, q, b, u, res = r['latency'], r['quality'], r['bandwidth'], r['usage'], r['resources']
         share = ', '.join(f'{k} {v}%' for k, v in u['share_by_rendition_pct'].items())
-        lines.append(f"| {r['mode']} | {q['viewer_psnr']:.2f} | {q['shown_psnr']:.2f} | {l['p50_ms']:.0f}/{l['p95_ms']:.0f}/"
+        vmaf_text = f"{q['viewer_vmaf']:.1f}" if 'viewer_vmaf' in q else '-'
+        lpips_text = f"{q['viewer_lpips']:.3f}" if 'viewer_lpips' in q else '-'
+        lines.append(f"| {r['mode']} | {q['viewer_psnr']:.2f} | {vmaf_text} | {lpips_text} | {q['shown_psnr']:.2f} | {l['p50_ms']:.0f}/{l['p95_ms']:.0f}/"
                      f"{l['max_ms']:.0f} | {l['shown']}/{l['dropped_late']}/{l['skipped']} | {q['longest_freeze_ms']:.0f} | "
                      f"{b['mean_kbps']:.0f} | {res['model_gpu_share_pct']} | {res.get('gpu_util_mean_pct', '-')} | "
                      f"{res.get('gpu_power_mean_w', '-')} | {share} |")
@@ -324,7 +345,10 @@ def main() -> None:
     parser.add_argument('--path', type=PathConditions.parse, default=PathConditions(),
                         help='with --netem: one-way delay and jitter (ms), loss (%%), router queue (packets), '
                              'for example delay=20,jitter=5,loss=0.1,limit=300')
+    parser.add_argument('--no-perceptual', dest='perceptual', action='store_false',
+                        help='score PSNR only, without VMAF and LPIPS (upstream_vsr/metrics.py)')
     args = parser.parse_args()
+    lpips = Lpips() if args.perceptual else None
     if args.netem and os.geteuid() != 0:
         raise SystemExit('--netem needs root to create the namespace and shape it; run under sudo')
 
@@ -361,7 +385,8 @@ def main() -> None:
                 else:
                     raise RuntimeError(f'{source.name}: {mode}: encoder kept failing')
                 gpu = gpu_stats(out / 'gpu.csv', client['resources']['unix_begin'], client['resources']['unix_end'])
-                quality = score(client, out / 'frames.raw', reference_frames(reference_path), fps, phases)
+                quality = score(client, out / 'frames.raw', reference_frames(reference_path), fps, phases,
+                                lpips=lpips, reference_again=reference_frames(reference_path) if args.perceptual else None)
                 (out / 'quality.json').write_text(json.dumps(quality) + '\n')
                 if not args.keep_frames:
                     (out / 'frames.raw').unlink()

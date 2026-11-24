@@ -44,7 +44,7 @@ if '--display' in sys.argv:
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from live.controller import TradeoffController, load_table  # noqa: E402
+from live.controller import MpcController, TradeoffController, load_table  # noqa: E402
 from live.policy import DepthPolicy  # noqa: E402
 from live.protocol import LABEL, SCALE, Channel, parse_packet, parse_rung, rung_name  # noqa: E402
 from upstream_vsr.encoding import SIZES  # noqa: E402
@@ -269,13 +269,13 @@ def run(args: argparse.Namespace) -> dict:
         ladder = [name for name in header['ladder'] if parse_rung(name, 0)[0] in args.renditions]
         if header['start'] not in ladder:
             raise SystemExit(f"the server starts on {header['start']}, outside --renditions {args.renditions}")
-        controller = TradeoffController(
+        controller = (MpcController if args.abr == 'mpc' else TradeoffController)(
             load_table(args.rate_quality), ladder, 1 / fps,
             latency_budget_s=max(args.playout_delay - args.processing_margin, 0.01), policy=policy,
             gpu_share=args.gpu_share, deadline_s=args.playout_delay + args.drop_late - args.processing_margin,
             gpu_aware=args.gpu_aware)
         controller.start(header['start'], time.monotonic())
-        report['controller'] = {'gpu_share': args.gpu_share, 'latency_budget_s': controller.latency_budget_s,
+        report['controller'] = {'abr': args.abr, 'gpu_share': args.gpu_share, 'latency_budget_s': controller.latency_budget_s,
                                 'rate_quality': str(args.rate_quality), 'ladder': ladder}
 
     packets: queue.Queue = queue.Queue(maxsize=args.queue)
@@ -503,6 +503,8 @@ def main() -> None:
     parser.add_argument('--port', type=int, default=8766)
     parser.add_argument('--schedule', help='switch requests by frame, for example 0:x4,90:x2@28,180:direct')
     parser.add_argument('--controller', action='store_true', help='choose rungs with the trade-off controller')
+    parser.add_argument('--abr', choices=['tradeoff', 'mpc'], default='tradeoff',
+                        help='with --controller: the trade-off controller, or the RobustMPC baseline')
     parser.add_argument('--rate-quality', type=Path, default=Path(__file__).resolve().parent.parent / 'configs/rate_quality.json',
                         help='table from scripts/measure_rate_quality.py, for --controller')
     parser.add_argument('--renditions', nargs='+', default=['direct', 'x2', 'x4'], choices=['direct', 'x2', 'x4'],

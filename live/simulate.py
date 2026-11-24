@@ -20,7 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from live.controller import TradeoffController, load_table  # noqa: E402
+from live.controller import MpcController, TradeoffController, load_table  # noqa: E402
 from live.link import parse_link  # noqa: E402
 from live.policy import DepthPolicy  # noqa: E402
 from upstream_vsr.encoding import KEYINT  # noqa: E402
@@ -39,10 +39,11 @@ def at(schedule: list[tuple[float, float]], t: float) -> float:
 
 def simulate(table: dict, ladder: list[str], link: list[tuple[float, float]], seconds: float, start: str,
              fps: float = 30.0, playout_delay: float = 0.15, gpu_load: list[tuple[float, float]] | None = None,
-             gpu_share: float = 0.6, key_ratio: float = 4.0, use_model: bool = True, drop_late: float = 0.05) -> dict:
+             gpu_share: float = 0.6, key_ratio: float = 4.0, use_model: bool = True, drop_late: float = 0.05,
+             abr: str = 'tradeoff') -> dict:
     policy = DepthPolicy(3, 1 / fps) if use_model else None
-    controller = TradeoffController(table, ladder, 1 / fps, latency_budget_s=playout_delay - 0.025,
-                                    policy=policy, gpu_share=gpu_share,
+    controller = (MpcController if abr == 'mpc' else TradeoffController)(
+        table, ladder, 1 / fps, latency_budget_s=playout_delay - 0.025, policy=policy, gpu_share=gpu_share,
                                     deadline_s=playout_delay + drop_late - 0.025)
     controller.start(start, 0.0)
 
