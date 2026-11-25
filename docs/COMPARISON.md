@@ -395,7 +395,8 @@ model in brackets:
 | mobile | x4 | 27.42 (25.95) | 2217 / 35 / 448 | 161 | 17.5 (21.7) |
 | mobile | **adaptive** | **28.00** (27.44) | 1886 / 130 / 684 | 227 | 11.2 (13.6) |
 
-- **Adaptive is still best on both profiles**: +1.5 dB over the best fixed mode on
+- **Adaptive is still best on both profiles** (three clips; on 10 clips it is level
+  with x4 only, see the last section): +1.5 dB over the best fixed mode on
   broadband and +0.6 dB on mobile (earlier model: +1.9 and +0.9). Per clip it is best
   in 3 of 6 runs and within 0.3 dB of the best in 2 more. It loses clearly only on
   LjOrDJOjSMg over mobile, to x4 only (27.40 vs 25.20 dB), as with the earlier model.
@@ -536,3 +537,74 @@ python scripts/compare_modes.py data/test-clips/*.mp4 --half --resume --out resu
     --modes direct x2 x4 adaptive mpc mpc-direct adaptive-efrlfn adaptive-span adaptive-nanovsr adaptive-cdavsr
 python scripts/summarise_clips.py results/multiclip/summary.json --json results/multiclip/ci.json --markdown results/multiclip/ci.md
 ```
+
+## tc netem on 10 clips, with confidence intervals and RobustMPC (2026-11-25)
+
+`sudo bash scripts/run_netem.sh multi`. The first 10 test clips run over real TCP
+shaped with tc netem. Same profiles and rate schedule as above; modes direct, x2, x4,
+adaptive, mpc and mpc-direct; final model (results/multiclip-netem-broadband,
+results/multiclip-netem-mobile; 120 runs).
+
+**Run validity:**
+- **One run redone.** Broadband p-kAI-qOeJA mpc-direct ran while other work loaded the
+  CPU: its 720p decode was 30% slower than in the clean emulated run, and the clock was
+  4.02 GHz. It was redone (results/multiclip-netem-broadband).
+- **All others are clean:**
+  - CPU at 4.0–4.3 GHz;
+  - decode times at or below the clean runs of the same clips.
+- **Two mobile MPC runs** (LjOrDJOjSMg mpc, NRqG3AEOVGg mpc-direct) show up to 0.9 s
+  of server release lag. This lag comes from the network, not the machine:
+  - The encoder stayed 33 ms ahead and the CPU clock was normal.
+  - The sender's blocking write stalled because MPC sent more than the lossy link
+    carried, with no backlog guard.
+  - That is part of what this test measures, so the runs are kept.
+
+Adaptive minus each mode, paired by clip, ± 95% CI (clips adaptive wins). Bold: the
+interval excludes zero.
+
+| Profile | vs | Viewer PSNR dB | VMAF | LPIPS | p95 ms | Late + skipped | Longest freeze ms |
+|---|---|---:|---:|---:|---:|---:|---:|
+| broadband | direct | **+2.14 ± 1.61** (8/10) | **+6.7 ± 4.8** | **−0.055 ± 0.049** | −3 ± 21 | **−116 ± 103** | −2227 ± 2940 |
+| broadband | x2 | +1.76 ± 2.27 (6/10) | +2.6 ± 8.0 | −0.042 ± 0.065 | −3 ± 14 | −81 ± 123 | −1786 ± 2629 |
+| broadband | x4 | +0.86 ± 1.04 (7/10) | **+7.1 ± 4.0** | **−0.022 ± 0.020** | **+12 ± 9** | **+96 ± 33** | **+891 ± 473** |
+| broadband | mpc | **+1.83 ± 0.77** (9/10) | **+10.0 ± 3.7** | **−0.052 ± 0.035** | +4 ± 9 | −42 ± 59 | **−2538 ± 2075** |
+| broadband | mpc-direct | **+3.77 ± 2.28** (9/10) | **+13.9 ± 8.0** | **−0.092 ± 0.067** | −38 ± 54 | **−148 ± 103** | **−4330 ± 3781** |
+| mobile | direct | **+2.97 ± 2.06** (7/10) | **+6.4 ± 5.6** | **−0.063 ± 0.053** | +7 ± 39 | **−172 ± 107** | **−2806 ± 2410** |
+| mobile | x2 | +1.56 ± 2.03 (6/10) | −1.3 ± 5.4 | −0.025 ± 0.050 | +6 ± 46 | −80 ± 107 | −2078 ± 2316 |
+| mobile | x4 | −0.04 ± 0.60 (5/10) | +1.4 ± 3.1 | −0.002 ± 0.020 | +39 ± 40 | **+87 ± 64** | +520 ± 655 |
+| mobile | mpc | **+1.44 ± 0.86** (9/10) | **+5.8 ± 5.4** | **−0.029 ± 0.026** | +13 ± 33 | −46 ± 78 | **−1704 ± 1191** |
+| mobile | mpc-direct | **+2.92 ± 2.27** (8/10) | +6.5 ± 7.8 | −0.066 ± 0.065 | **−51 ± 48** | **−140 ± 125** | **−4324 ± 3388** |
+
+Adaptive itself: 30.07 ± 2.56 dB on broadband and 27.19 ± 2.33 dB on mobile.
+
+### What the 10 clips show
+
+- **Against RobustMPC, the controller is ahead on both profiles:**
+  - +1.83 ± 0.77 dB (broadband) and +1.44 ± 0.86 dB (mobile), on 9 of 10 clips each;
+  - higher VMAF and lower LPIPS;
+  - a longest freeze 1.7–2.5 s shorter.
+  The gain is larger than on the emulated link (+1.32 dB). Over real TCP, MPC's lagging
+  estimate and lack of a backlog guard cost more.
+- **Against 720p delivery, with or without MPC, the gain is large and significant:**
+  +2.1 to +3.8 dB.
+- **×4 only is not beaten.**
+  - On broadband, adaptive is +0.86 ± 1.04 dB in PSNR (not significant). It is
+    significantly ahead in VMAF (+7.1) and LPIPS.
+  - On mobile it ties: −0.04 ± 0.60 dB, with VMAF and LPIPS level.
+  - ×4 only has the lowest bitrate, so it has the fewest late and skipped frames, the
+    shortest freezes and the lowest p95 latency on both profiles.
+  - On mobile, adaptive's late and skipped frames are 87 higher, and its p95 latency
+    39 ± 40 ms higher.
+- **×2 only:** adaptive is ahead on average, by 1.6–1.8 dB, but the interval includes
+  zero. ×2 only fails badly on some clips and holds level on others.
+- **This revises the three-clip result.** On three clips, adaptive beat every fixed
+  mode, by +1.5 dB (broadband) and +0.6 dB (mobile). On 10 clips:
+  - it clearly beats direct-only delivery and RobustMPC;
+  - it is level with ×4 only, which has better latency and freezes.
+  On a lossy, high-delay path, the safest fixed choice (always the smallest stream)
+  is hard to beat. The controller still pays for its moves to larger streams in late
+  frames.
+- **Possible improvements:**
+  - make the capacity estimate account for loss and RTT, so the controller reacts to
+    TCP's effective rate;
+  - lower the latency budget on lossy paths.

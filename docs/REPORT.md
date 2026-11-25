@@ -41,8 +41,11 @@ Results:
   over the same ladder: +1.32 ± 0.44 dB, +7.4 VMAF and 33 ms lower p95 latency.
 - **Offline, the model leads on PSNR but not on perceptual metrics.** CDA-VSR and SPAN
   score higher VMAF at ×4, because UpStreamVSR was trained on a pixel loss.
-- **Over real TCP shaped with tc netem**, adaptive delivery beats every fixed delivery
-  mode: by 1.5 dB on a broadband profile and 0.6 dB on a mobile one.
+- **Over real TCP shaped with tc netem** (10 clips):
+  - Adaptive delivery beats RobustMPC by 1.4–1.8 dB and 720p-only delivery by 2.1–3.0 dB,
+    on a broadband profile and a mobile one.
+  - It does not beat fixed ×4 delivery significantly: +0.9 dB on broadband (not
+    significant), and level on mobile, where ×4 has the lower latency.
 - **Ablations** show that the sender's backlog guard is the largest single contribution
   (0.83 dB, and half the late frames).
 - **The recurrent memory**, borrowed from recent video super-resolution, added no
@@ -534,20 +537,48 @@ Bold Δ: the interval excludes zero.
 - **The three-clip result was clip luck.** On three clips ×2 only led by 0.35 dB; on 18,
   PSNR is tied.
 
-Real TCP with tc netem (3 clips):
+Real TCP with tc netem, **10 clips** (adaptive minus mode, paired by clip, ± 95% CI;
+clips adaptive wins; bold: the interval excludes zero):
 
 ![tc netem](figures/netem.png)
+
+| vs | Broadband PSNR dB | Broadband VMAF | Mobile PSNR dB | Mobile VMAF |
+|---|---:|---:|---:|---:|
+| direct only | **+2.14 ± 1.61** (8/10) | **+6.7 ± 4.8** | **+2.97 ± 2.06** (7/10) | **+6.4 ± 5.6** |
+| ×2 only | +1.76 ± 2.27 (6/10) | +2.6 ± 8.0 | +1.56 ± 2.03 (6/10) | −1.3 ± 5.4 |
+| ×4 only | +0.86 ± 1.04 (7/10) | **+7.1 ± 4.0** | −0.04 ± 0.60 (5/10) | +1.4 ± 3.1 |
+| RobustMPC, full ladder | **+1.83 ± 0.77** (9/10) | **+10.0 ± 3.7** | **+1.44 ± 0.86** (9/10) | **+5.8 ± 5.4** |
+| RobustMPC, direct only | **+3.77 ± 2.28** (9/10) | **+13.9 ± 8.0** | **+2.92 ± 2.27** (8/10) | +6.5 ± 7.8 |
+| *adaptive itself* | *30.07 dB* | *61.1* | *27.19 dB* | *46.0* |
+
+- **Adaptive clearly beats RobustMPC and 720p delivery on both profiles.** The MPC gap
+  is larger here than on the emulated link (+1.32 dB). Over TCP, MPC's lagging estimate
+  and missing backlog guard cost more, and its longest freeze is 1.7–2.5 s longer.
+- **×4 only is not beaten.**
+  - On broadband, adaptive leads in VMAF and LPIPS, but its PSNR lead (+0.86 dB) is not
+    significant.
+  - On mobile, the two tie on every quality metric.
+  - ×4 only, the smallest stream, has the fewest late and skipped frames and the
+    shortest freezes on both profiles. On mobile, adaptive has 87 more late and skipped
+    frames and a 39 ms higher p95 latency.
+- **×2 only** is behind on average (1.6–1.8 dB), but it varies too much across clips
+  for significance.
+- **Why real TCP hurts fixed modes:** a lost packet stalls everything behind it, so
+  rates that fit on an emulated link overflow the deadline.
+- **This revises the three-clip run** (below), where adaptive beat every fixed mode.
+  On a lossy path, always sending the smallest stream is a strong policy, and the
+  controller still pays in late frames when it moves to larger streams.
+
+The earlier three-clip run, for reference:
 
 | Profile | Direct | ×2 | ×4 | **Adaptive** |
 |---|---:|---:|---:|---:|
 | Broadband (40 ms RTT, 0.1% loss) | 28.03 | 27.73 | 28.85 | **30.35** |
 | Mobile (80 ms RTT, 1% loss) | 24.58 | 25.72 | 27.42 | **28.00** |
 
-- **Adaptive is best on both profiles:** +1.5 dB on broadband and +0.6 dB on mobile.
-- **Why real TCP hurts fixed modes:** a lost packet stalls everything behind it, so
-  rates that fit on an emulated link overflow the deadline. Only the controller backs
-  off.
-- **Per clip,** adaptive is best in 3 of 6 runs and within 0.3 dB in 2 more. It loses
+- On these three clips adaptive was best on both profiles: +1.5 dB on broadband and
+  +0.6 dB on mobile.
+- **Per clip,** adaptive was best in 3 of 6 runs and within 0.3 dB in 2 more. It loses
   clearly once, to ×4 only, on one clip over mobile.
 - **Noise:** real-network runs vary by 0.3–1.5 dB from run to run, even for direct,
   which uses no model.
@@ -622,10 +653,15 @@ another process holding the GPU at 98% utilisation.
   maximises predicted PSNR. Where direct and ×2 are nearly tied in PSNR, it switches to
   direct, which costs VMAF and LPIPS against staying on ×2. A perceptual quality table,
   or a switching penalty, is the natural fix.
-- **Three clips were not enough.** Two three-clip conclusions shrank or reversed on 18
-  clips:
+- **Three clips were not enough.** Three three-clip conclusions shrank or reversed on
+  more clips:
   - the margin over the published models;
-  - ×2 only beating adaptive.
+  - ×2 only beating adaptive on the emulated link;
+  - adaptive beating ×4 only over real TCP.
+- **On lossy paths, the controller should be more cautious.** Over tc netem, fixed ×4
+  matches it in quality with fewer late frames. A capacity estimate that accounts for
+  loss and RTT, or a tighter latency budget on lossy links, is the next controller
+  change to try.
   Paired confidence intervals over clips should be the default.
 - **The bandwidth case for upscaling is real but bounded.** Below about 1 Mbit/s,
   sending fewer pixels and upscaling wins; above that, direct wins. The controller's job
@@ -636,7 +672,9 @@ another process holding the GPU at 98% utilisation.
 - **Hardware and scale:**
   - one laptop GPU;
   - the emulated-link and offline comparisons use 18 clips of 30 s each;
-  - the tc netem runs use 3 clips, and each mode runs once per clip;
+  - the tc netem runs use 10 clips;
+  - each mode runs once per clip, so run-to-run noise over real TCP (0.3–1.5 dB) is
+    inside the intervals but not separated from clip differences;
   - networks are emulated or shaped on one machine.
 - **Metrics:** PSNR, VMAF and LPIPS, but no user study.
   - The model was trained for PSNR, and it trails CDA-VSR and SPAN on perceptual
@@ -651,7 +689,8 @@ another process holding the GPU at 98% utilisation.
 - A perceptual term (LPIPS or a feature loss) in fine-tuning, and a quality table in
   VMAF for the controller.
 - A small user study.
-- The tc netem comparison on more clips (`sudo bash scripts/run_netem.sh multi`).
+- A loss- and RTT-aware capacity estimate for the controller, to close the gap to fixed
+  ×4 delivery on lossy paths.
 - A weaker GPU, where anytime depth and GPU awareness should matter.
 - Fine-tuning the published models on StreamSR, for a stricter comparison.
 - 1080p output.

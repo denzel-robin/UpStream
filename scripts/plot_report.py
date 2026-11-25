@@ -7,8 +7,8 @@ Needs only matplotlib and numpy (any Python with them, for example the system on
 
 Inputs: configs/rate_quality.json, results/baselines/offline.json,
 results/no-state/offline.json, results/final/baselines-live/summary.json,
-results/final/compare/summary.json, results/netem-*/summary.json,
-results/multiclip/ci.json.
+results/final/compare/summary.json, results/multiclip/ci.json,
+results/multiclip-netem-*/ci.json.
 """
 from __future__ import annotations
 
@@ -176,24 +176,35 @@ def timeline(clip: str = 'NRqG3AEOVGg@1440.mp4') -> None:
     plt.close(fig)
 
 
+def forest(ax, ci: dict, rows: list[tuple[str, str]], metric: str, digits: int) -> None:
+    """Adaptive minus each mode with its 95% interval: blue if adaptive is better, orange if worse, gray if neither."""
+    ax.axvline(0, color=INK2, linewidth=1)
+    for i, (mode, _) in enumerate(rows):
+        d = ci[mode][metric]['reference_minus_mode']
+        lo, hi = d['mean'] - d['ci95'], d['mean'] + d['ci95']
+        colour = BLUE if lo > 0 else ORANGE if hi < 0 else GRAY
+        ax.plot([lo, hi], [i, i], color=colour, linewidth=2, solid_capstyle='round')
+        ax.scatter(d['mean'], i, s=60, color=colour, edgecolor=SURFACE, linewidth=2, zorder=3)
+        ax.text(hi, i + 0.28, f"{d['mean']:+.{digits}f}", ha='right', color=INK2, fontsize=8)
+    ax.grid(axis='y', visible=False)
+    ax.set_ylim(-0.6, len(rows) - 0.3)
+
+
 def netem() -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.2))
-    labels = {'direct': 'Direct only', 'x2': 'x2 only', 'x4': 'x4 only', 'adaptive': 'Adaptive'}
+    rows = [('x4', 'x4 only'), ('x2', 'x2 only'), ('direct', 'Direct only'), ('mpc', 'RobustMPC, full ladder'),
+            ('mpc-direct', 'RobustMPC, direct only')][::-1]
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.4), sharey=True)
     for ax, profile, title in ((axes[0], 'broadband', 'Broadband (40 ms RTT, 0.1% loss)'),
                                (axes[1], 'mobile', 'Mobile (80 ms RTT, 1% loss)')):
-        modes = runs(f'results/netem-{profile}/summary.json')
-        rows = [(labels[m], viewer(modes[m])) for m in labels]
-        names, values = zip(*rows)
-        dots(ax, names, values, [BLUE if n == 'Adaptive' else GRAY for n in names])
+        forest(ax, load(f'results/multiclip-netem-{profile}/ci.json')['modes'], rows, 'viewer_psnr', 2)
         ax.set_title(title)
-        ax.set_xlabel('Viewer PSNR, dB')
-        ax.grid(axis='y', visible=False)
-    fig.suptitle('Real TCP shaped with tc netem, 3 clips: adaptive beats every fixed mode', x=0.01, ha='left',
-                 fontsize=11, fontweight='bold', color=INK)
+        ax.set_xlabel('Adaptive minus mode, viewer PSNR dB')
+    axes[0].set_yticks(range(len(rows)), [label for _, label in rows])
+    fig.suptitle('Real TCP with tc netem, 10 clips, paired 95% intervals. Blue: adaptive better; gray: not significant',
+                 x=0.01, ha='left', fontsize=10, fontweight='bold', color=INK)
     fig.tight_layout()
     fig.savefig(OUT / 'netem.png', dpi=160)
     plt.close(fig)
-
 
 def multiclip() -> None:
     """Adaptive minus each mode, paired by clip, with 95% intervals (scripts/summarise_clips.py)."""
@@ -203,26 +214,15 @@ def multiclip() -> None:
             ('adaptive-span', 'SPAN in controller'), ('adaptive-cdavsr', 'CDA-VSR in controller'),
             ('adaptive-efrlfn', 'EfRLFN in controller')][::-1]
     fig, axes = plt.subplots(1, 2, figsize=(9, 4.0), sharey=True)
-    for ax, metric, title in ((axes[0], 'viewer_psnr', 'Viewer PSNR, dB'), (axes[1], 'viewer_vmaf', 'VMAF')):
-        ax.axvline(0, color=INK2, linewidth=1)
-        for i, (mode, _) in enumerate(rows):
-            d = ci[mode][metric]['reference_minus_mode']
-            lo, hi = d['mean'] - d['ci95'], d['mean'] + d['ci95']
-            colour = BLUE if lo > 0 else ORANGE if hi < 0 else GRAY
-            ax.plot([lo, hi], [i, i], color=colour, linewidth=2, solid_capstyle='round')
-            ax.scatter(d['mean'], i, s=60, color=colour, edgecolor=SURFACE, linewidth=2, zorder=3)
-            ax.text(hi, i + 0.28, f"{d['mean']:+.{2 if metric == 'viewer_psnr' else 1}f}", ha='right',
-                    color=INK2, fontsize=8)
+    for ax, metric, title, digits in ((axes[0], 'viewer_psnr', 'Viewer PSNR, dB', 2), (axes[1], 'viewer_vmaf', 'VMAF', 1)):
+        forest(ax, ci, rows, metric, digits)
         ax.set_title(f'Adaptive minus mode: {title}')
-        ax.grid(axis='y', visible=False)
-        ax.set_ylim(-0.6, len(rows) - 0.3)
     axes[0].set_yticks(range(len(rows)), [label for _, label in rows])
     fig.suptitle('Emulated link, 18 clips, paired 95% intervals. Blue: adaptive better; orange: worse; gray: not significant',
                  x=0.01, ha='left', fontsize=10, fontweight='bold', color=INK)
     fig.tight_layout()
     fig.savefig(OUT / 'multiclip.png', dpi=160)
     plt.close(fig)
-
 
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
