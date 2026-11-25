@@ -404,3 +404,135 @@ model in brackets:
   TCP loss recovery and jitter differ from run to run. The changes against the
   earlier model are within that spread.
 - The model's GPU time falls by 18–28%, as on the emulated link.
+
+## 18 clips, confidence intervals, VMAF and LPIPS, and an MPC baseline (2026-11-25)
+
+The emulated-link comparison repeated on all 18 test clips, with ten modes per clip:
+
+- the four delivery modes;
+- the four published models in the adaptive controller (docs/BASELINES.md);
+- two runs of a standard adaptive-bitrate controller in place of ours.
+
+Same link (2500, 500 from 10 s, 1500 from 20 s kbit/s), 30 s per clip, final model,
+float16 (results/multiclip, 180 runs).
+
+**MPC baseline.** RobustMPC (Yin et al., SIGCOMM 2015), `MpcController` in
+live/controller.py, adapted to live delivery:
+
+- **Throughput:** the harmonic mean of the last 5 per-GOP capacity samples, divided by
+  1 + the largest recent relative prediction error.
+- **Planning:** exhaustive search, with pruning, over the next 5 GOPs. It maximises
+  Σ PSNR − μ·stall − |ΔPSNR|. A stall is the part of the sender queue above the latency
+  budget, and μ is the highest quality on the ladder.
+- **Scope:** it decides once per keyframe and uses the same predicted-PSNR table.
+- Two runs:
+  - **mpc**, over the full 13-rung ladder;
+  - **mpc-direct**, over direct rungs only. This is a conventional ABR stream with no
+    upscaling.
+
+**New metrics.** VMAF (libvmaf, vmaf_v0.6.1) and LPIPS (AlexNet; lower is better) are
+computed on what the viewer saw, as viewer PSNR is: late or skipped slots count as the
+held frame.
+
+**Statistics.** The clip is the unit, with a t-based 95% interval over the 18 clips.
+Differences are paired by clip: Δ = adaptive − mode, followed by the number of clips on
+which adaptive is better (`scripts/summarise_clips.py`, results/multiclip/ci.md).
+
+**Run validity.**
+- Every run records:
+  - the CPU load before it started;
+  - the median clock of the fastest core;
+  - the server's largest send lag.
+- compare_modes.py waits for an idle machine and rejects runs below 2.5 GHz.
+- Two earlier attempts were discarded: one under CPU contention, and one with the
+  laptop's power limit stuck at 11 W (1.4 GHz, client decode 42 ms per frame).
+- In the kept runs:
+  - the CPU ran at 4.0–4.3 GHz;
+  - the encoder kept up within 5 ms on every clip, the 1440p60 sources included.
+  - 77 runs from the first session predate the health record. They ran from 13:11 to
+    14:58 on 2026-11-24, before the contention began.
+
+Mean over clips (± 95% CI):
+
+| Mode | Viewer PSNR dB | VMAF | LPIPS | p95 ms | Late + skipped | Longest freeze ms | kbps | Model GPU % | GPU W |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| direct | 30.23 ± 1.91 | 59.1 ± 6.5 | 0.177 | 170 ± 10 | 94 ± 38 | 1384 | 633 | 0.0 | 14.0 |
+| x2 | 30.82 ± 1.77 | **65.7** ± 5.9 | **0.163** | 167 ± 6 | 80 ± 32 | 1280 | 686 | 17.0 | 22.3 |
+| x4 | 29.21 ± 1.50 | 54.8 ± 4.5 | 0.224 | **157** ± 0 | **26** ± 7 | **809** | 452 | 18.8 | 23.4 |
+| **adaptive** | **30.84** ± 1.56 | 63.0 ± 5.1 | 0.175 | 161 ± 2 | 65 ± 13 | 1278 | 654 | 13.0 | 21.4 |
+| mpc (full ladder) | 29.51 ± 1.74 | 55.6 ± 7.1 | 0.215 | 194 ± 28 | 107 ± 23 | 2327 | 567 | 12.4 | 21.3 |
+| mpc-direct | 29.03 ± 2.02 | 54.1 ± 7.3 | 0.211 | 201 ± 26 | 132 ± 36 | 2384 | 643 | 0.0 | 13.8 |
+| adaptive, EfRLFN | 29.89 ± 1.60 | 51.1 ± 5.5 | 0.220 | 159 ± 2 | 59 ± 13 | 1290 | 600 | 23.3 | 38.4 |
+| adaptive, SPAN | 30.12 ± 1.58 | 61.1 ± 5.4 | 0.179 | 158 ± 1 | 57 ± 13 | 1277 | 608 | 20.0 | 36.3 |
+| adaptive, NanoVSR | 30.27 ± 1.56 | 57.8 ± 5.1 | 0.179 | 157 ± 1 | 59 ± 12 | 1264 | 598 | 18.7 | 32.3 |
+| adaptive, CDA-VSR | 29.84 ± 1.85 | 57.8 ± 6.4 | 0.185 | 181 ± 11 | 108 ± 39 | 1373 | 613 | 4.1 | 17.3 |
+
+The absolute intervals are wide because the clips differ in difficulty. The paired
+differences remove that spread:
+
+| Adaptive minus | Viewer PSNR dB | VMAF | LPIPS (negative: adaptive better) | p95 ms |
+|---|---:|---:|---:|---:|
+| direct | +0.61 ± 0.69 (10/18) | **+3.9 ± 2.1** (15/18) | −0.002 ± 0.019 (8/18) | −9 ± 11 (8/18) |
+| x2 | +0.02 ± 0.51 (8/18) | **−2.7 ± 1.7** (3/18) | **+0.012 ± 0.010** (2/18) | **−6 ± 6** (16/18) |
+| x4 | **+1.62 ± 0.70** (18/18) | **+8.2 ± 2.6** (17/18) | **−0.049 ± 0.014** (17/18) | +4 ± 2 (1/18) |
+| mpc | **+1.32 ± 0.44** (16/18) | **+7.4 ± 2.5** (16/18) | **−0.039 ± 0.015** (17/18) | **−33 ± 26** (16/18) |
+| mpc-direct | **+1.81 ± 0.82** (15/18) | **+8.9 ± 3.0** (16/18) | **−0.036 ± 0.023** (13/18) | **−40 ± 25** (14/18) |
+| adaptive, EfRLFN | **+0.95 ± 0.25** (18/18) | **+11.9 ± 2.1** (18/18) | **−0.045 ± 0.015** (18/18) | +2 ± 2 (5/18) |
+| adaptive, SPAN | **+0.72 ± 0.27** (15/18) | **+1.9 ± 0.9** (16/18) | −0.004 ± 0.006 (12/18) | +3 ± 2 (3/18) |
+| adaptive, NanoVSR | **+0.57 ± 0.24** (16/18) | **+5.2 ± 1.4** (18/18) | −0.004 ± 0.007 (9/18) | +3 ± 2 (3/18) |
+| adaptive, CDA-VSR | **+1.00 ± 0.66** (13/18) | **+5.3 ± 2.0** (16/18) | −0.010 ± 0.017 (10/18) | **−20 ± 12** (12/18) |
+
+Bold: the 95% interval excludes zero.
+
+### What the 18 clips show
+
+- **Against MPC, the controller is better on every quality metric and on latency.**
+  Over the same 13-rung ladder and quality table, the trade-off controller gains:
+  - +1.32 ± 0.44 dB and +7.4 VMAF;
+  - lower LPIPS on 17 of 18 clips;
+  - half the longest freeze (1.3 s against 2.3 s);
+  - a p95 latency 33 ms lower.
+- **Why MPC loses.** Most of the loss is in the drop to 500 kbit/s: 25.4 dB against
+  27.0 dB in that phase. Three things cause it:
+  - The harmonic mean of past GOPs lags a sudden drop.
+  - MPC commits for a whole GOP and has no backlog guard. It made 60 backlog skips over
+    the 18 clips, against 26 for the controller.
+  - After the drop, the large prediction error keeps its robustness discount high. In
+    the last phase it uses 26% of the 1500 kbit/s link, against 42% for the controller.
+- **Upscaling helps MPC too.** mpc-direct, a conventional ABR stream, is 0.48 dB below
+  MPC over the full ladder, close to the 0.61 dB between direct-only and adaptive
+  delivery.
+- **Against the published models, the gains hold on 18 clips:** +0.57 dB (NanoVSR) to
+  +1.00 dB (CDA-VSR) in viewer PSNR, and +1.9 to +11.9 VMAF.
+  - Against SPAN, NanoVSR and CDA-VSR, LPIPS is within noise.
+  - The others use 32–38 W of GPU power against 21 W.
+  - The three-clip estimates (+0.95 to +1.33 dB) were high: those three clips favoured
+    UpStreamVSR more than the average.
+  - Offline, SPAN and CDA-VSR have higher VMAF than UpStreamVSR at ×4
+    (docs/BASELINES.md). Live, they score lower, because neither can run ×2 in time.
+- **Against fixed delivery:**
+  - **×4 only:** adaptive is ahead on every quality metric, on 17–18 of 18 clips.
+  - **Direct only:** adaptive is ahead in VMAF (+3.9, 15/18). The PSNR gain
+    (+0.61 dB) is not significant, and LPIPS is level.
+  - **×2 only** is the honest exception:
+    - PSNR is tied (+0.02 ± 0.51 dB).
+    - ×2 only is better perceptually: 2.7 VMAF points higher, and lower LPIPS on 16 of
+      18 clips.
+    - Adaptive gives lower latency (16/18), 4 points less model GPU time, 0.9 W less
+      power and 5% fewer bits.
+    - The likely cause is the controller's switching. It maximises predicted PSNR, and
+      at mid rates direct and ×2 are close in PSNR. So it moves to direct when the link
+      allows (28% of frames). ×2 + UpStreamVSR scores higher than direct in VMAF and
+      LPIPS, as the offline table shows. A quality table in VMAF, or a switching
+      penalty, would address this; neither has been tried.
+- **The three-clip ranking of ×2 only vs adaptive was clip luck.** On three clips ×2
+  only led by 0.35 dB. On 18 clips, PSNR is tied, and in latency and cost the
+  controller is better.
+
+### Commands
+
+```
+python scripts/compare_modes.py data/test-clips/*.mp4 --half --resume --out results/multiclip \
+    --modes direct x2 x4 adaptive mpc mpc-direct adaptive-efrlfn adaptive-span adaptive-nanovsr adaptive-cdavsr
+python scripts/summarise_clips.py results/multiclip/summary.json --json results/multiclip/ci.json --markdown results/multiclip/ci.md
+```

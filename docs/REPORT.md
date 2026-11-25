@@ -31,11 +31,16 @@ It was trained on real compressed video (StreamSR).
 
 Results:
 
-- **Offline**, it beats four recent published models (EfRLFN, SPAN, NanoVSR, CDA-VSR) at
-  every bitrate tested, and is the fastest of them: 33.09 dB in 5.0 ms at ×4, against
+- **Offline**, it beats four recent published models (EfRLFN, SPAN, NanoVSR, CDA-VSR) in PSNR
+  at every bitrate tested, and is the fastest of them: 33.09 dB in 5.0 ms at ×4, against
   32.62 dB in 41.8 ms for CDA-VSR.
-- **In the live system**, it gives 0.95–1.33 dB higher viewer PSNR than the same system
-  running those models, at 55–62% of their GPU power.
+- **In the live system** (18 clips, 95% confidence intervals), it gives 0.57–1.00 dB
+  higher viewer PSNR and 1.9–11.9 points higher VMAF than the same system running those
+  models, at 56–66% of their GPU power.
+- **The trade-off controller beats RobustMPC**, a standard adaptive-bitrate algorithm,
+  over the same ladder: +1.32 ± 0.44 dB, +7.4 VMAF and 33 ms lower p95 latency.
+- **Offline, the model leads on PSNR but not on perceptual metrics.** CDA-VSR and SPAN
+  score higher VMAF at ×4, because UpStreamVSR was trained on a pixel loss.
 - **Over real TCP shaped with tc netem**, adaptive delivery beats every fixed delivery
   mode: by 1.5 dB on a broadband profile and 0.6 dB on a mobile one.
 - **Ablations** show that the sender's backlog guard is the largest single contribution
@@ -396,6 +401,18 @@ One clip on the emulated link (2500 kbit/s, then 500 from 10 s, then 1500 from 2
   - NanoVSR's backward branch sees only the current frame.
   - CDA-VSR uses the motion-compensation error in place of decoder residuals.
   - Details are in `docs/BASELINES.md`.
+- **Perceptual metrics.** VMAF (libvmaf, vmaf_v0.6.1) and LPIPS (AlexNet; lower is
+  better) are computed on the same viewer sequence as viewer PSNR.
+- **18 clips with confidence intervals.** The emulated-link comparison was repeated on
+  all 18 test clips. Results give a t-based 95% interval over clips. Differences are
+  paired by clip: adaptive minus mode, with the number of clips on which adaptive wins.
+  Each run records the CPU clock and encoder lag, so runs on a throttled machine are
+  rejected.
+- **Controller baseline.** RobustMPC (Yin et al., 2015), adapted to live delivery:
+  - harmonic-mean throughput with an error discount;
+  - a 5-GOP look-ahead over the same ladder and predicted-quality table;
+  - a QoE of quality minus a stall penalty and a switching penalty.
+  It is run over the full ladder and over direct rungs only, a conventional ABR stream.
 
 ### 7.2 Against published models
 
@@ -414,6 +431,13 @@ One clip on the emulated link (2500 kbit/s, then 500 from 10 s, then 1500 from 2
 - **Flicker:** it is the steadiest at every rung, tied with EfRLFN at x4@33.
 - **×2 live:** it is the only model fast enough. EfRLFN (64 ms) and SPAN (44 ms) run at
   full 360p resolution.
+- **Perceptual metrics do not favour it.**
+  - At ×4, CDA-VSR has the best VMAF and LPIPS at every rung, 5.8–8.1 VMAF above
+    UpStreamVSR. SPAN is 0.7–4.5 above.
+  - At ×2, SPAN has lower LPIPS everywhere and higher VMAF at CRF 18–23.
+  - UpStreamVSR beats bicubic, EfRLFN and (on VMAF) NanoVSR everywhere.
+  - The likely cause is its Charbonnier and edge loss, which rewards pixel accuracy
+    over detail.
 
 **Live, same controller** (3 clips; viewer PSNR):
 
@@ -439,6 +463,24 @@ One clip on the emulated link (2500 kbit/s, then 500 from 10 s, then 1500 from 2
 - **×4 only, where delivery is identical:** UpStreamVSR leads by 1.1–2.2 dB, at under
   half the GPU time.
 
+**Live, adaptive, 18 clips** (adaptive with UpStreamVSR minus adaptive with each model,
+paired by clip; ± 95% CI, clips UpStreamVSR wins):
+
+| Model | Viewer PSNR dB | VMAF | LPIPS | GPU W |
+|---|---:|---:|---:|---:|
+| EfRLFN | +0.95 ± 0.25 (18/18) | +11.9 ± 2.1 (18/18) | −0.045 ± 0.015 (18/18) | 38.4 |
+| SPAN | +0.72 ± 0.27 (15/18) | +1.9 ± 0.9 (16/18) | −0.004 ± 0.006 (12/18) | 36.3 |
+| NanoVSR | +0.57 ± 0.24 (16/18) | +5.2 ± 1.4 (18/18) | −0.004 ± 0.007 (9/18) | 32.3 |
+| CDA-VSR | +1.00 ± 0.66 (13/18) | +5.3 ± 2.0 (16/18) | −0.010 ± 0.017 (10/18) | 17.3 |
+| *UpStreamVSR (reference)* | *30.84 dB* | *63.0* | *0.175* | *21.4* |
+
+- **The PSNR and VMAF gains are significant against all four models.** LPIPS is level
+  against SPAN, NanoVSR and CDA-VSR.
+- **The three-clip gains (0.95–1.33 dB) overstated the margin.** On 18 clips it is
+  0.57–1.00 dB.
+- **Offline vs live:** SPAN and CDA-VSR have higher VMAF than UpStreamVSR offline at ×4,
+  but lower VMAF live, because neither can run ×2 in time.
+
 ### 7.3 Adaptive vs fixed delivery
 
 Emulated link (3 clips):
@@ -455,6 +497,42 @@ Emulated link (3 clips):
   model). The controller's caution costs a little here. It keeps headroom below the
   capacity estimate, and it moves to direct when the link allows.
 - The real network reverses this: ×2 only is the worst mode on broadband and the second-worst on mobile.
+
+![18 clips](figures/multiclip.png)
+
+Emulated link, **18 clips**, with RobustMPC (mean ± 95% CI; Δ is adaptive minus mode,
+paired by clip, with the clips adaptive wins):
+
+| Mode | Viewer PSNR dB | Δ PSNR | Δ VMAF | Δ LPIPS | p95 ms | Model GPU % | GPU W |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| direct only | 30.23 ± 1.91 | +0.61 ± 0.69 (10/18) | **+3.9 ± 2.1** | −0.002 ± 0.019 | 170 | 0.0 | 14.0 |
+| ×2 only | 30.82 ± 1.77 | +0.02 ± 0.51 (8/18) | **−2.7 ± 1.7** | **+0.012 ± 0.010** | 167 | 17.0 | 22.3 |
+| ×4 only | 29.21 ± 1.50 | **+1.62 ± 0.70** (18/18) | **+8.2 ± 2.6** | **−0.049 ± 0.014** | 157 | 18.8 | 23.4 |
+| RobustMPC, full ladder | 29.51 ± 1.74 | **+1.32 ± 0.44** (16/18) | **+7.4 ± 2.5** | **−0.039 ± 0.015** | 194 | 12.4 | 21.3 |
+| RobustMPC, direct only | 29.03 ± 2.02 | **+1.81 ± 0.82** (15/18) | **+8.9 ± 3.0** | **−0.036 ± 0.023** | 201 | 0.0 | 13.8 |
+| **adaptive** | **30.84 ± 1.56** | | | | 161 | 13.0 | 21.4 |
+
+Bold Δ: the interval excludes zero.
+
+- **Against RobustMPC, the controller is ahead on every quality metric and on latency.**
+  - The gain over the same ladder is 1.32 ± 0.44 dB. The longest freeze is halved, and
+    p95 latency is 33 ms lower.
+  - MPC loses mostly in the bandwidth drop (25.4 against 27.0 dB in that phase). Its
+    harmonic-mean estimate lags the drop, and it commits for a whole GOP with no
+    backlog guard: 60 sender backlog skips over the 18 clips, against 26.
+  - It then stays cautious. It uses 26% of the restored link against 42%.
+- **Against ×4 only, adaptive wins on all 18 clips.** Against direct only, the VMAF gain
+  is significant but the PSNR gain (+0.61 dB) is not.
+- **×2 only is the exception.**
+  - PSNR is tied, and ×2 only is better perceptually: 2.7 VMAF points, and lower LPIPS
+    on 16 of 18 clips.
+  - Adaptive has lower latency on 16 of 18 clips, 4 points less model GPU time, 0.9 W
+    less power and 5% fewer bits.
+  - The controller maximises predicted PSNR. At mid rates direct and ×2 are close in
+    PSNR, so it moves to direct, for 28% of frames, although ×2 + UpStreamVSR looks
+    better there.
+- **The three-clip result was clip luck.** On three clips ×2 only led by 0.35 dB; on 18,
+  PSNR is tied.
 
 Real TCP with tc netem (3 clips):
 
@@ -540,27 +618,41 @@ another process holding the GPU at 98% utilisation.
     180p/360p inputs with one-second GOPs, it did not pay at this model size.
   - GPU awareness and anytime depth are safeguards whose value shows only on weaker
     hardware.
+- **The controller is optimised for the wrong metric where it matters least.** It
+  maximises predicted PSNR. Where direct and ×2 are nearly tied in PSNR, it switches to
+  direct, which costs VMAF and LPIPS against staying on ×2. A perceptual quality table,
+  or a switching penalty, is the natural fix.
+- **Three clips were not enough.** Two three-clip conclusions shrank or reversed on 18
+  clips:
+  - the margin over the published models;
+  - ×2 only beating adaptive.
+  Paired confidence intervals over clips should be the default.
 - **The bandwidth case for upscaling is real but bounded.** Below about 1 Mbit/s,
   sending fewer pixels and upscaling wins; above that, direct wins. The controller's job
   is to know which side of the crossover it is on, frame by frame.
 
 ## 9. Limitations
 
-- **Hardware and scale:** one laptop GPU; live comparisons use 3 clips × 30 s, offline
-  ones 18 clips; networks are emulated or shaped on one machine.
-- **Metrics:** PSNR only, with no VMAF, LPIPS or user study. PSNR may undersell EfRLFN,
-  whose authors rank by subjective quality, and SPAN, trained on clean images.
+- **Hardware and scale:**
+  - one laptop GPU;
+  - the emulated-link and offline comparisons use 18 clips of 30 s each;
+  - the tc netem runs use 3 clips, and each mode runs once per clip;
+  - networks are emulated or shaped on one machine.
+- **Metrics:** PSNR, VMAF and LPIPS, but no user study.
+  - The model was trained for PSNR, and it trails CDA-VSR and SPAN on perceptual
+    metrics offline.
+  - The controller's quality table is in PSNR.
 - **Baselines:** the published models were adapted to run causally and were not
   fine-tuned on StreamSR.
 - **Output resolution:** 720p only.
 
 ## 10. Future work
 
-- Perceptual metrics (VMAF, LPIPS) and a small user study.
-- More clips, with confidence intervals.
+- A perceptual term (LPIPS or a feature loss) in fine-tuning, and a quality table in
+  VMAF for the controller.
+- A small user study.
+- The tc netem comparison on more clips (`sudo bash scripts/run_netem.sh multi`).
 - A weaker GPU, where anytime depth and GPU awareness should matter.
-- A standard ABR algorithm (for example MPC) over the same ladder, as a controller
-  baseline.
 - Fine-tuning the published models on StreamSR, for a stricter comparison.
 - 1080p output.
 - Keyframe-aware rung pricing.
@@ -574,10 +666,12 @@ streaming:
   rather than always on.
 - **When the model is built for the deadline** rather than for an offline benchmark.
 
-The 217k-parameter UpStreamVSR beats four recent published models at every bitrate
-tested, while running fast enough to make ×2 and ×4 delivery usable live. Inside the
-adaptive system, it gives about 1 dB higher viewer quality than those models, at roughly
-half their GPU power.
+The 217k-parameter UpStreamVSR beats four recent published models in PSNR at every
+bitrate tested, while running fast enough to make ×2 and ×4 delivery usable live. Inside the
+adaptive system, it gives 0.6–1.0 dB higher viewer PSNR than those models on 18 clips,
+at roughly 60% of their GPU power. The trade-off controller beats RobustMPC over the
+same ladder by 1.3 dB. On perceptual metrics the offline lead does not hold; that is
+the clearest next step.
 
 ## References
 
@@ -592,6 +686,12 @@ half their GPU power.
   Devices, MobiCom 2020.
 - J. Kim et al., Neural-Enhanced Live Streaming: Improving Live Video Ingest via Online
   Learning (LiveNAS), SIGCOMM 2020.
+- X. Yin et al., A Control-Theoretic Approach for Dynamic Adaptive Video Streaming over
+  HTTP (MPC, RobustMPC), SIGCOMM 2015.
+- Z. Li et al., Toward a Practical Perceptual Video Quality Metric (VMAF), Netflix
+  Technology Blog, 2016.
+- R. Zhang et al., The Unreasonable Effectiveness of Deep Features as a Perceptual
+  Metric (LPIPS), CVPR 2018.
 - G. Bjøntegaard, Calculation of average PSNR differences between RD-curves, VCEG-M33,
   2001.
 

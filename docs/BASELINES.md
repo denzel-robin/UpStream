@@ -57,7 +57,44 @@ PSNR (dB) against the 720p reference, and median ms per frame:
   at x4@33 (35.58 dB). The earlier model with recurrent state flickered more than
   bicubic and EfRLFN at x4@28–33 (34.76 vs 35.58 dB at x4@33); removing the state fixed it.
 
+### Perceptual metrics: VMAF and LPIPS
+
+The same run repeated with VMAF (FFmpeg libvmaf, model vmaf_v0.6.1, every frame) and
+LPIPS (AlexNet, every 4th frame) added, `upstream_vsr/metrics.py`
+(results/final/offline.json; its PSNR matches the table above to 0.01 dB). VMAF is out
+of 100, higher is better; LPIPS is a distance, lower is better. Bold is the best value.
+
+| Rung | **UpStreamVSR** | bicubic | EfRLFN | SPAN | NanoVSR | CDA-VSR |
+|---|---:|---:|---:|---:|---:|---:|
+| x2@18 | 88.7 · 0.065 | 84.0 · 0.085 | 77.7 · 0.101 | **89.9 · 0.057** | | |
+| x2@23 | 83.5 · 0.089 | 78.3 · 0.106 | 72.7 · 0.121 | **83.7 · 0.080** | | |
+| x2@28 | **73.6** · 0.126 | 68.3 · 0.142 | 63.7 · 0.155 | 72.8 · **0.120** | | |
+| x2@33 | **59.1** · 0.176 | 54.4 · 0.190 | 50.9 · 0.202 | 57.8 · **0.171** | | |
+| x4@18 | 68.9 · 0.166 | 52.9 · 0.227 | 44.6 · 0.231 | 73.4 · 0.153 | 64.1 · 0.150 | **77.0 · 0.134** |
+| x4@23 | 61.6 · 0.192 | 46.2 · 0.250 | 39.4 · 0.254 | 64.4 · 0.182 | 56.5 · 0.178 | **69.4 · 0.158** |
+| x4@28 | 49.9 · 0.231 | 36.5 · 0.284 | 31.5 · 0.288 | 51.2 · 0.227 | 44.8 · 0.221 | **57.7 · 0.197** |
+| x4@33 | 35.9 · 0.276 | 25.6 · 0.323 | 22.3 · 0.329 | 36.6 · 0.276 | 31.7 · 0.271 | **41.7 · 0.249** |
+
+- **UpStreamVSR does not lead on the perceptual metrics.** At x4, CDA-VSR is best on
+  both metrics at every rung (VMAF +5.8 to +8.1 over UpStreamVSR), and SPAN scores 0.7–4.5
+  VMAF points higher. At x2, SPAN has the lower LPIPS everywhere and the higher VMAF at
+  CRF 18–23; UpStreamVSR leads VMAF at CRF 28–33.
+- UpStreamVSR beats bicubic and EfRLFN on both metrics everywhere, and NanoVSR on VMAF
+  everywhere (NanoVSR has 0.005–0.016 lower LPIPS at x4).
+- The likely cause is the training loss: Charbonnier plus edge loss rewards pixel
+  accuracy, which raises PSNR but leaves outputs smoother than the models trained for
+  detail. A perceptual term (LPIPS or a feature loss) in fine-tuning is the obvious
+  next step; it was not tried.
+- Speed still decides the live system: CDA-VSR (41.7 ms) cannot run x4 at 30 fps, and
+  SPAN (44 ms at x2, 12 ms at x4) uses 2.4× UpStreamVSR's time at x4 and cannot run x2
+  live. The live comparison below and docs/COMPARISON.md score what the viewer saw,
+  including frames lost to slowness.
+
 ## Live: the full pipeline, three clips
+
+On all 18 clips, with confidence intervals and VMAF and LPIPS, see the last section of
+docs/COMPARISON.md. The gains there are smaller: +0.57 to +1.00 dB viewer PSNR and
++1.9 to +11.9 VMAF, all significant, with LPIPS level against SPAN, NanoVSR and CDA-VSR.
 
 `python scripts/compare_modes.py <3 clips> --modes adaptive adaptive-efrlfn ... x4-cdavsr --half`
 (results/baselines/live). Same emulated link as docs/COMPARISON.md (2500, 500 from 10 s,

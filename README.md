@@ -29,9 +29,11 @@ All results are measured on an NVIDIA RTX 3050 Laptop GPU (4 GB).
 
 | | |
 |---|---|
-| Against four recent published models (EfRLFN, SPAN, NanoVSR, CDA-VSR), offline, 18 clips | Best PSNR at all 8 ×2/×4 bitrates. At ×4: **33.09 dB in 5.0 ms** per frame, vs 32.62 dB in 41.8 ms for CDA-VSR, the closest. Least flicker of all. |
-| The same models in the live pipeline, same controller | **+0.95 to +1.33 dB** viewer PSNR, at 55–62% of their GPU power. UpStreamVSR is the only one fast enough for ×2 live. |
-| Adaptive vs fixed delivery over real TCP (tc netem) | Adaptive beats direct-only, ×2-only and ×4-only by **+1.5 dB** (broadband) and **+0.6 dB** (mobile). |
+| Against four recent published models (EfRLFN, SPAN, NanoVSR, CDA-VSR), offline, 18 clips | Best PSNR at all 8 ×2/×4 bitrates. At ×4: **33.09 dB in 5.0 ms** per frame, vs 32.62 dB in 41.8 ms for CDA-VSR, the closest. Least flicker of all. On VMAF and LPIPS, CDA-VSR and SPAN are better at ×4. |
+| The same models in the live pipeline, same controller, 18 clips | **+0.57 to +1.00 dB** viewer PSNR and **+1.9 to +11.9 VMAF** (all significant at 95%), at 56–66% of their GPU power. UpStreamVSR is the only one fast enough for ×2 live. |
+| Against RobustMPC, a standard ABR controller, same ladder, 18 clips | **+1.32 ± 0.44 dB** viewer PSNR, +7.4 VMAF, 33 ms lower p95 latency, half the longest freeze. |
+| Adaptive vs fixed delivery, emulated link, 18 clips | Ahead of ×4-only on every metric (18/18 clips in PSNR); ahead of direct-only in VMAF (+3.9). Tied with ×2-only in PSNR but 2.7 VMAF behind it; less latency and GPU time. |
+| Adaptive vs fixed delivery over real TCP (tc netem), 3 clips | Adaptive beats direct-only, ×2-only and ×4-only by **+1.5 dB** (broadband) and **+0.6 dB** (mobile). |
 | Bandwidth | For the same PSNR, ×4 + UpStreamVSR needs about 30% fewer bits than direct 720p (BD-rate −28.7%). |
 | Stability | A 5-minute live run held 30 fps, with a flat 155 ms median display latency. |
 
@@ -40,6 +42,7 @@ frame counts as the previous frame held on screen, so latency problems show up a
 lost quality.
 
 ![Speed and quality at x4](docs/figures/speed_quality.png)
+![18-clip comparison](docs/figures/multiclip.png)
 ![Live comparison](docs/figures/live_models.png)
 
 ## How it works
@@ -129,9 +132,10 @@ loads them from `$UPSTREAM_EXTERNAL` (default `~/Github/btp-vsr/external`).
 ## Limitations
 
 - One laptop GPU.
-- Live comparisons use 3 clips × 30 s; offline comparisons use 18 clips.
+- Emulated-link and offline comparisons use 18 clips × 30 s; the tc netem runs use 3 clips.
 - The networks are emulated, or shaped with tc netem on one machine.
-- Quality is measured in PSNR only.
+- Quality is measured in PSNR, VMAF and LPIPS, with no user study. The model and the
+  controller are tuned for PSNR, which costs them on the perceptual metrics.
 - The published models were adapted to run causally, one frame at a time
   ([docs/BASELINES.md](docs/BASELINES.md)).
 

@@ -134,9 +134,9 @@ def score(client: dict, record: Path, reference, fps: float, phases: list[tuple[
               'shown_psnr': round(float(np.mean([v for v, f in zip(per_slot, fresh) if f and v is not None])), 3),
               'frozen_slots': int(sum(not f for f in fresh)), 'freeze_events': len(freezes),
               'longest_freeze_ms': round(max(freezes, default=0) / fps * 1000, 1), 'per_phase': []}
-    if lpips is not None:
+    if lpips is not None and lpips_slot:
         result['viewer_lpips'] = round(float(np.mean(lpips_slot)), 4)
-    if reference_again is not None:
+    if reference_again is not None and any(h is not None for h in held):  # nothing shown: no sequence to score
         first = next(i for i, h in enumerate(held) if h is not None)
         height, width = shape[:2]
         scores = vmaf((frames[h] for h in held[first:]),
@@ -198,6 +198,30 @@ def rung_usage(client: dict, fps: float) -> dict:
             'switches': len(client['summary'].get('switches', []))}
 
 
+def health(client: dict, out: Path, load_before: float) -> dict:
+    """Conditions outside the pipeline under test: the CPU clock, the load before the
+    run, and how far the server's live encoder fell behind real time (a source too
+    heavy to encode live on this machine delays every mode alike)."""
+    frames, fps = client['frames'], client['header']['fps']
+    lag = max(((f['sent'] - frames[0]['sent']) - f['index'] / fps for f in frames), default=0.0) if frames else None
+    cpu = json.loads((out / 'cpu.json').read_text())['max_core_ghz_median'] if (out / 'cpu.json').exists() else None
+    return {'load_before': round(load_before, 2), 'cpu_ghz': None if cpu is None else round(cpu, 2),
+            'encoder_lag_max_s': None if lag is None else round(lag, 3)}
+
+
+def wait_for_idle(max_load: float | None) -> None:
+    """Hold the next run while other work loads the CPU: a busy CPU slows decoding and
+    every mode would fall behind for reasons outside the pipeline."""
+    if not max_load:
+        return
+    waited = 0
+    while os.getloadavg()[0] > max_load:
+        if waited % 300 == 0:
+            print(f'waiting: load {os.getloadavg()[0]:.1f} > {max_load}', flush=True)
+        time.sleep(10)
+        waited += 10
+
+
 def as_user() -> list[str]:
     """Under sudo, run children as the invoking user (their files, their CUDA context)."""
     user = os.environ.get('SUDO_USER')
@@ -250,6 +274,16 @@ def run_mode(args, source: Path, mode: str, out: Path, port: int) -> tuple[dict,
         load = subprocess.Popen([*as_user(), PYTHON, str(ROOT / 'scripts/gpu_load.py'), '--size', size,
                                  '--busy-ms', busy, '--idle-ms', idle], stdout=subprocess.PIPE, text=True)
         load.stdout.readline()
+    cpu_samples, cpu_done = [], threading.Event()
+
+    def sample_cpu() -> None:  # the fastest core's clock, every 0.5 s
+        while not cpu_done.wait(0.5):
+            clocks = [int(f.read_text()) for f in Path('/sys/devices/system/cpu').glob('cpu[0-9]*/cpufreq/scaling_cur_freq')]
+            if clocks:
+                cpu_samples.append(max(clocks) / 1e6)
+
+    cpu_thread = threading.Thread(target=sample_cpu, daemon=True)
+    cpu_thread.start()
     gpu_log = open(out / 'gpu.csv', 'w')
     sampler = subprocess.Popen(['nvidia-smi', '--query-gpu=timestamp,utilization.gpu,power.draw,temperature.gpu,memory.used',
                                 '--format=csv,noheader,nounits', '-lms', '200'], stdout=gpu_log)
@@ -264,6 +298,10 @@ def run_mode(args, source: Path, mode: str, out: Path, port: int) -> tuple[dict,
             command.append('--half')
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
     finally:
+        cpu_done.set()
+        cpu_thread.join(timeout=2)
+        (out / 'cpu.json').write_text(json.dumps({'max_core_ghz_median': float(np.median(cpu_samples)) if cpu_samples else None,
+                                                  'samples': len(cpu_samples)}) + '\n')
         sampler.terminate()
         sampler.wait()
         if load is not None:
@@ -345,6 +383,10 @@ def main() -> None:
     parser.add_argument('--path', type=PathConditions.parse, default=PathConditions(),
                         help='with --netem: one-way delay and jitter (ms), loss (%%), router queue (packets), '
                              'for example delay=20,jitter=5,loss=0.1,limit=300')
+    parser.add_argument('--min-cpu-ghz', type=float, default=2.5,
+                        help='stop if the fastest core ran below this during a run (a power-limited laptop); 0: never')
+    parser.add_argument('--max-load', type=float, default=(os.cpu_count() or 8) / 2,
+                        help='wait before each run until the 1-minute load average is below this (0: never wait)')
     parser.add_argument('--no-perceptual', dest='perceptual', action='store_false',
                         help='score PSNR only, without VMAF and LPIPS (upstream_vsr/metrics.py)')
     args = parser.parse_args()
@@ -377,7 +419,15 @@ def main() -> None:
                     rows.append(row)
                     continue
                 for attempt in range(3):  # ffmpeg occasionally crashes with 13 outputs; run again
+                    wait_for_idle(args.max_load)
+                    load_before = os.getloadavg()[0]
                     client, server = run_mode(args, source, mode, out, port)
+                    client['health'] = health(client, out, load_before)
+                    (out / 'client.json').write_text(json.dumps(client) + '\n')
+                    if args.min_cpu_ghz and (client['health']['cpu_ghz'] or 0) < args.min_cpu_ghz:
+                        raise SystemExit(f"{source.name}: {mode}: the CPU ran at {client['health']['cpu_ghz']} GHz "
+                                         f"(< {args.min_cpu_ghz}): power-limited, results would be invalid. Fix it and "
+                                         f"run again with --resume.")
                     port += 1
                     if server.get('returncode') == 0:
                         break

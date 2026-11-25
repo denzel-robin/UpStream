@@ -7,7 +7,8 @@ Needs only matplotlib and numpy (any Python with them, for example the system on
 
 Inputs: configs/rate_quality.json, results/baselines/offline.json,
 results/no-state/offline.json, results/final/baselines-live/summary.json,
-results/final/compare/summary.json, results/netem-*/summary.json.
+results/final/compare/summary.json, results/netem-*/summary.json,
+results/multiclip/ci.json.
 """
 from __future__ import annotations
 
@@ -194,9 +195,38 @@ def netem() -> None:
     plt.close(fig)
 
 
+def multiclip() -> None:
+    """Adaptive minus each mode, paired by clip, with 95% intervals (scripts/summarise_clips.py)."""
+    ci = load('results/multiclip/ci.json')['modes']
+    rows = [('x2', 'x2 only'), ('direct', 'Direct only'), ('x4', 'x4 only'), ('mpc', 'RobustMPC, full ladder'),
+            ('mpc-direct', 'RobustMPC, direct only'), ('adaptive-nanovsr', 'NanoVSR in controller'),
+            ('adaptive-span', 'SPAN in controller'), ('adaptive-cdavsr', 'CDA-VSR in controller'),
+            ('adaptive-efrlfn', 'EfRLFN in controller')][::-1]
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4.0), sharey=True)
+    for ax, metric, title in ((axes[0], 'viewer_psnr', 'Viewer PSNR, dB'), (axes[1], 'viewer_vmaf', 'VMAF')):
+        ax.axvline(0, color=INK2, linewidth=1)
+        for i, (mode, _) in enumerate(rows):
+            d = ci[mode][metric]['reference_minus_mode']
+            lo, hi = d['mean'] - d['ci95'], d['mean'] + d['ci95']
+            colour = BLUE if lo > 0 else ORANGE if hi < 0 else GRAY
+            ax.plot([lo, hi], [i, i], color=colour, linewidth=2, solid_capstyle='round')
+            ax.scatter(d['mean'], i, s=60, color=colour, edgecolor=SURFACE, linewidth=2, zorder=3)
+            ax.text(hi, i + 0.28, f"{d['mean']:+.{2 if metric == 'viewer_psnr' else 1}f}", ha='right',
+                    color=INK2, fontsize=8)
+        ax.set_title(f'Adaptive minus mode: {title}')
+        ax.grid(axis='y', visible=False)
+        ax.set_ylim(-0.6, len(rows) - 0.3)
+    axes[0].set_yticks(range(len(rows)), [label for _, label in rows])
+    fig.suptitle('Emulated link, 18 clips, paired 95% intervals. Blue: adaptive better; orange: worse; gray: not significant',
+                 x=0.01, ha='left', fontsize=10, fontweight='bold', color=INK)
+    fig.tight_layout()
+    fig.savefig(OUT / 'multiclip.png', dpi=160)
+    plt.close(fig)
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    for figure in (rate_quality, speed_quality, live_models, timeline, netem):
+    for figure in (rate_quality, speed_quality, live_models, timeline, netem, multiclip):
         figure()
         print('wrote', figure.__name__)
 
