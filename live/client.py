@@ -273,9 +273,13 @@ def run(args: argparse.Namespace) -> dict:
             load_table(args.rate_quality), ladder, 1 / fps,
             latency_budget_s=max(args.playout_delay - args.processing_margin, 0.01), policy=policy,
             gpu_share=args.gpu_share, deadline_s=args.playout_delay + args.drop_late - args.processing_margin,
-            gpu_aware=args.gpu_aware)
+            gpu_aware=args.gpu_aware, metric=args.quality_metric,
+            **({} if args.abr == 'mpc' else {'loss_aware': args.loss_aware, 'loss_weight': args.loss_weight,
+                                             'tcp_share': args.tcp_share}))
         controller.start(header['start'], time.monotonic())
         report['controller'] = {'abr': args.abr, 'gpu_share': args.gpu_share, 'latency_budget_s': controller.latency_budget_s,
+                                'metric': args.quality_metric, 'loss_aware': args.loss_aware and args.abr != 'mpc',
+                                'loss_weight': args.loss_weight, 'tcp_share': args.tcp_share,
                                 'rate_quality': str(args.rate_quality), 'ladder': ladder}
 
     packets: queue.Queue = queue.Queue(maxsize=args.queue)
@@ -505,6 +509,15 @@ def main() -> None:
     parser.add_argument('--controller', action='store_true', help='choose rungs with the trade-off controller')
     parser.add_argument('--abr', choices=['tradeoff', 'mpc'], default='tradeoff',
                         help='with --controller: the trade-off controller, or the RobustMPC baseline')
+    parser.add_argument('--quality-metric', choices=['psnr', 'vmaf'], default='psnr',
+                        help='what the controller maximises, from the rate-quality table')
+    parser.add_argument('--loss-aware', action='store_true',
+                        help="use the server's TCP statistics: cap capacity by TCP's ceiling and price stalls")
+    parser.add_argument('--loss-weight', type=float, default=0.0,
+                        help='with --loss-aware: dB of PSNR lost per unit of expected stalled time (0: off; '
+                             'did not help in tuning)')
+    parser.add_argument('--tcp-share', type=float, default=0.5,
+                        help="with --loss-aware: fraction of TCP's throughput ceiling the stream may use")
     parser.add_argument('--rate-quality', type=Path, default=Path(__file__).resolve().parent.parent / 'configs/rate_quality.json',
                         help='table from scripts/measure_rate_quality.py, for --controller')
     parser.add_argument('--renditions', nargs='+', default=['direct', 'x2', 'x4'], choices=['direct', 'x2', 'x4'],

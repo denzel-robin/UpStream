@@ -30,6 +30,7 @@ import argparse
 import csv
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,11 @@ MODES = {
     # standard ABR rule; mpc-direct is a conventional stream, MPC over 720p rungs only.
     'mpc': (ALL, 'x4@28', ['--abr', 'mpc'], []),
     'mpc-direct': (['direct'], 'direct@33', ['--abr', 'mpc'], []),
+    # The controller maximising predicted VMAF instead of PSNR, and using the server's TCP
+    # statistics on lossy paths (live/controller.py, docs/COMPARISON.md).
+    'adaptive-vmaf': (ALL, 'x4@28', ['--quality-metric', 'vmaf'], []),
+    'adaptive-loss': (ALL, 'x4@28', ['--loss-aware'], []),
+    'adaptive-vmaf-loss': (ALL, 'x4@28', ['--quality-metric', 'vmaf', '--loss-aware'], []),
 }
 # Published models in place of UpStreamVSR (upstream_vsr/baselines.py), with the same
 # controller; it times each model, so a model without x2 or too slow for the GPU budget
@@ -222,6 +228,16 @@ def wait_for_idle(max_load: float | None) -> None:
         waited += 10
 
 
+def define_modes(argv: list[str]) -> list[str]:
+    """Register --define modes before argparse checks --modes against MODES."""
+    for i, arg in enumerate(argv):
+        spec = argv[i + 1] if arg == '--define' and i + 1 < len(argv) else arg[9:] if arg.startswith('--define=') else None
+        if spec:
+            name, _, extra = spec.partition('=')
+            MODES[name] = (ALL, 'x4@28', shlex.split(extra), [])
+    return argv
+
+
 def as_user() -> list[str]:
     """Under sudo, run children as the invoking user (their files, their CUDA context)."""
     user = os.environ.get('SUDO_USER')
@@ -364,10 +380,14 @@ def markdown(rows: list[dict]) -> str:
 
 
 def main() -> None:
+    define_modes(sys.argv[1:])  # before --modes is checked against MODES
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('sources', type=Path, nargs='+')
     parser.add_argument('--checkpoint', type=Path, default=ROOT / 'runs/kaggle-7-no-state/run/best-calibrated.pt')
     parser.add_argument('--modes', nargs='+', default=DEFAULT_MODES, choices=list(MODES))
+    parser.add_argument('--define', action='append', default=[], metavar="NAME='CLIENT ARGS'",
+                        help="an extra adaptive mode with these client arguments, for example "
+                             "--define \"loss-w25=--loss-aware --loss-weight 25\"; then list NAME in --modes")
     parser.add_argument('--link', default='0:2500,10:500,20:1500')
     parser.add_argument('--seconds', type=float, default=30)
     parser.add_argument('--playout-delay', type=float, default=0.15)

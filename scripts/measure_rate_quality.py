@@ -9,8 +9,9 @@ bicubic, and scored against the 720p reference.
 x2 and x4 use the CRFs the model was trained on. Direct gets more CRFs, down to low
 rates, because the fair comparison is against direct delivery at the same bitrate.
 
-Writes a JSON table with per-clip and mean bitrate and PSNR per rung, and BD-rate
-against direct delivery. live/controller.py reads its 'rungs' entry.
+Writes a JSON table with per-clip and mean bitrate, PSNR and VMAF per rung (per exit
+for x2 and x4), and BD-rate against direct delivery. live/controller.py reads its
+'rungs' entry; --quality-metric vmaf in the client uses the VMAF column.
 """
 from __future__ import annotations
 
@@ -33,6 +34,7 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 from live.client import load_model  # noqa: E402
 from upstream_vsr.codec import decode_with_motion  # noqa: E402
 from upstream_vsr.encoding import X264, frame_step, ladder_graph  # noqa: E402
+from upstream_vsr.metrics import vmaf  # noqa: E402
 from upstream_vsr.model import crf_to_quality  # noqa: E402
 from prepare_streamsr import CRFS, probe  # noqa: E402
 
@@ -63,6 +65,14 @@ def frame_psnr(output: torch.Tensor, target: torch.Tensor) -> float:
     return float(10 * torch.log10(255 ** 2 / error))
 
 
+def frame_vmaf(outputs: list[torch.Tensor], target: torch.Tensor) -> float:
+    """Mean VMAF of (1, 3, H, W) outputs in [0, 1] against (T, 3, H, W) uint8 targets."""
+    height, width = target.shape[-2:]
+    distorted = (o[0].clamp(0, 1).mul(255).round().byte().permute(1, 2, 0).cpu().numpy() for o in outputs)
+    reference = (target[t].permute(1, 2, 0).cpu().numpy() for t in range(len(outputs)))
+    return vmaf(distorted, reference, width, height)['vmaf']
+
+
 def temporal(outputs: list[torch.Tensor], target: torch.Tensor) -> float:
     """PSNR of frame-to-frame changes, as in evaluate_upstream.py (higher is steadier)."""
     values = []
@@ -87,7 +97,7 @@ def upscale_scores(model, frames, gt: torch.Tensor, scale: int, crf: int, device
     scores['bicubic'] = float(np.mean([frame_psnr(o, gt[t]) for t, o in enumerate(bicubic)]))
     scores['bicubic_temporal'] = temporal(bicubic, gt)
     del bicubic
-    psnrs, temporals, times = [], [], []
+    psnrs, temporals, times, vmafs = [], [], [], []
     for exit_index in range(len(model.exits)):
         state, outputs, values = None, [], []
         torch.cuda.synchronize() if device.type == 'cuda' else None
@@ -102,8 +112,9 @@ def upscale_scores(model, frames, gt: torch.Tensor, scale: int, crf: int, device
         times.append((time.perf_counter() - begin) / len(frames) * 1000)
         psnrs.append(float(np.mean(values)))
         temporals.append(temporal(outputs, gt))
+        vmafs.append(frame_vmaf(outputs, gt))
         del outputs
-    scores.update(psnr=psnrs, temporal=temporals, model_ms=times)
+    scores.update(psnr=psnrs, temporal=temporals, model_ms=times, vmaf=vmafs)
     return scores
 
 
@@ -111,7 +122,7 @@ def direct_scores(path: Path, gt: torch.Tensor, device) -> dict:
     frames = [frame.rgb for frame in decode_with_motion(path)]
     outputs = [to_tensor([f], device).float() / 255 for f in frames]
     return {'psnr': [float(np.mean([frame_psnr(o, gt[t]) for t, o in enumerate(outputs)]))],
-            'temporal': [temporal(outputs, gt)]}
+            'temporal': [temporal(outputs, gt)], 'vmaf': [frame_vmaf(outputs, gt)]}
 
 
 def encode_ladder(source: Path, work: Path, fps: float, seconds: float) -> dict[str, Path]:
@@ -244,7 +255,7 @@ def main() -> None:
     args.output.write_text(json.dumps(report, indent=1) + '\n')
     print(json.dumps({k: report[k] for k in ('bd_rate_vs_direct', 'bd_rate_of_mean_curves')}, indent=1))
     for name, entry in rungs.items():
-        print(f'{name:10s} {entry["kbps"]:8.1f} kbps  psnr {entry["psnr"]}')
+        print(f'{name:10s} {entry["kbps"]:8.1f} kbps  psnr {entry["psnr"]}  vmaf {entry["vmaf"]}')
 
 
 if __name__ == '__main__':

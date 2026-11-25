@@ -30,3 +30,22 @@ def socket_backlog(sock: socket.socket) -> int:
 
 def backlog_bytes(sock: socket.socket, link=None) -> int:
     return (link.queued_bytes if link is not None else 0) + socket_backlog(sock)
+
+
+# Offsets in Linux's struct tcp_info (include/uapi/linux/tcp.h), stable since 4.6.
+_TCP_INFO = {'rto_us': (8, 'I'), 'mss': (16, 'I'), 'rtt_us': (68, 'I'), 'rttvar_us': (72, 'I'),
+             'total_retrans': (100, 'I'), 'data_segs_out': (156, 'I')}
+
+
+def tcp_path(sock: socket.socket) -> dict | None:
+    """What the kernel's TCP knows about the path: smoothed RTT and its variation, the
+    retransmission timeout, the segment size, and running counts of data segments sent
+    and retransmitted (their ratio over a window is the loss rate). None where
+    TCP_INFO is unavailable (not Linux, or not a TCP socket)."""
+    try:
+        raw = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 232)
+    except (OSError, AttributeError):
+        return None
+    if len(raw) < 160:
+        return None
+    return {name: struct.unpack_from(kind, raw, offset)[0] for name, (offset, kind) in _TCP_INFO.items()}

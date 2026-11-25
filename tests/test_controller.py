@@ -201,3 +201,95 @@ def test_simulated_mpc_follows_a_drop():
     rungs = {second: [f['rung'] for f in result['frames'] if second <= f['sent'] < second + 1][-1]
              for second in (8, 18)}
     assert TABLE[rungs[18]]['kbps'] < 700 < TABLE[rungs[8]]['kbps']
+
+
+VMAF = {'direct@28': [99.0], 'direct@38': [72.0], 'direct@43': [53.0], 'x2@23': [94.0, 94.5, 94.7],
+        'x2@28': [81.0, 81.6, 81.8], 'x4@23': [66.0, 67.5, 67.7], 'x4@28': [50.6, 52.2, 52.4],
+        'x4@33': [34.6, 36.1, 36.2]}
+TABLE_VMAF = {name: {**entry, 'vmaf': VMAF[name]} for name, entry in TABLE.items()}
+
+
+def tcp_record(segs: int, retrans: int, rtt_ms: float = 80.0, rto_ms: float = 280.0, mss: int = 1448) -> dict:
+    return {'rate': None, 'kbps': {}, 'tcp': {'rtt_us': int(rtt_ms * 1000), 'rttvar_us': 10000, 'rto_us': int(rto_ms * 1000),
+                                               'mss': mss, 'data_segs_out': segs, 'total_retrans': retrans}}
+
+
+def test_vmaf_metric_prefers_x2_where_psnr_prefers_direct():
+    # About 1.2 Mbit/s: direct@38 has the higher PSNR, x2@28 the far higher VMAF.
+    table = {**TABLE_VMAF, 'direct@38': {**TABLE_VMAF['direct@38'], 'psnr': [31.0]}}
+    choices = {}
+    for metric in ('psnr', 'vmaf'):
+        controller = TradeoffController(table, LADDER, 1 / 30, 0.125, policy=policy_with(FAST), metric=metric)
+        controller.start('x4@28', 0.0)
+        controller.decide(feed_idle_link(controller, 1400))
+        choices[metric] = controller.current
+    assert choices == {'psnr': 'direct@38', 'vmaf': 'x2@28'}
+
+
+def test_vmaf_metric_needs_a_vmaf_column():
+    with pytest.raises(ValueError, match='vmaf'):
+        TradeoffController(TABLE, LADDER, 1 / 30, 0.125, metric='vmaf')
+
+
+def test_path_loss_and_tcp_ceiling_from_server_counters():
+    controller = TradeoffController(TABLE, LADDER, 1 / 30, 0.125, loss_aware=True)
+    controller.observe_rates(tcp_record(1000, 0))
+    assert controller.path_loss() is None  # one record: no window yet
+    controller.observe_rates(tcp_record(1100, 1))
+    assert controller.path_loss() is None  # too few segments for a rate
+    controller.observe_rates(tcp_record(2000, 10))
+    assert controller.path_loss() == pytest.approx(0.01)
+    # Mathis: 1448 B * 8 * sqrt(3/2) / (0.08 s * sqrt(0.01)) = 1.77 Mbit/s
+    assert controller.tcp_capacity() == pytest.approx(1773, rel=1e-3)
+
+
+def test_loss_aware_controller_stays_lower_on_a_lossy_path():
+    choices = {}
+    for loss_aware in (False, True):
+        controller = TradeoffController(TABLE, LADDER, 1 / 30, 0.125, policy=policy_with(FAST), loss_aware=loss_aware,
+                                        loss_weight=10.0)
+        controller.start('x4@28', 0.0)
+        for segs, retrans in ((0, 0), (1000, 10), (2000, 20)):  # 1% of segments retransmitted
+            controller.observe_rates(tcp_record(segs, retrans))
+        controller.decide(feed_idle_link(controller, 2500))
+        choices[loss_aware] = controller.current
+    assert choices[False] == 'x2@23'
+    assert controller.rate(choices[True]) < controller.rate(choices[False])
+    assert controller.stall_cost('x2@23') > controller.stall_cost('x4@28') > 0
+
+
+def test_loss_aware_controller_is_unchanged_without_loss():
+    choices = []
+    for loss_aware in (False, True):
+        controller = TradeoffController(TABLE, LADDER, 1 / 30, 0.125, policy=policy_with(FAST), loss_aware=loss_aware)
+        controller.start('x4@28', 0.0)
+        for segs in (0, 1000, 2000):
+            controller.observe_rates(tcp_record(segs, 0))
+        controller.decide(feed_idle_link(controller, 2500))
+        choices.append(controller.current)
+        assert controller.stall_cost('x2@23') == 0 and controller.usable_capacity() == controller.capacity
+    assert choices[0] == choices[1]
+
+
+def test_tcp_path_reads_the_kernel_counters():
+    from live.backlog import tcp_path
+    server = socket.create_server(('127.0.0.1', 0))
+    client = socket.create_connection(server.getsockname())
+    peer, _ = server.accept()
+    client.sendall(b'x' * 10000)
+    peer.recv(65536)
+    info = tcp_path(client)
+    for sock in (client, peer, server):
+        sock.close()
+    assert info is not None and info['data_segs_out'] >= 1 and info['mss'] > 0 and info['rto_us'] > 0
+
+
+def test_loss_aware_default_caps_capacity_without_pricing_stalls():
+    controller = TradeoffController(TABLE, LADDER, 1 / 30, 0.125, policy=policy_with(FAST), loss_aware=True)
+    controller.start('x4@28', 0.0)
+    for segs, retrans in ((0, 0), (1000, 10), (2000, 20)):
+        controller.observe_rates(tcp_record(segs, retrans))
+    controller.decide(feed_idle_link(controller, 2500))
+    assert controller.stall_cost('x2@23') == 0
+    assert controller.usable_capacity() == pytest.approx(0.5 * 1773, rel=1e-3)  # half the Mathis ceiling
+    assert controller.rate(controller.current) <= 0.85 * 0.5 * 1773

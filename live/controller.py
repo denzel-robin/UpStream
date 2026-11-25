@@ -26,6 +26,32 @@ measurement, try the next better rung after a quiet probe interval.
 
 Direct rungs need no GPU, so under GPU load the controller moves to direct when the
 link allows it; under a tight link it moves to x4, where the model recovers the most.
+
+Quality can be predicted PSNR or predicted VMAF (metric='vmaf'), from the same table.
+PSNR barely separates direct and x2 at mid rates, where x2 + UpStreamVSR is clearly
+better in VMAF, so a PSNR controller switches to direct where a viewer would not.
+
+Lossy paths (loss_aware=True). Over real TCP a lost segment stalls every frame behind
+it until the retransmission arrives, and the stall spills past the display deadline;
+the link's rate, which the delivery monitor measures, does not show this. The server
+reports TCP's own view of the path (RTT, retransmission timeout, segments sent and
+retransmitted) with each rate record, and the controller uses it twice:
+
+  capacity  TCP's throughput ceiling at that loss rate, MSS * sqrt(3/2) / (RTT *
+            sqrt(p)) (Mathis et al. 1997), caps the capacity: a stream near it is
+            window-limited and queues. tcp_share is the fraction of it allowed.
+  quality   each rung loses loss_weight x the expected fraction of time stalled,
+            p x its packets per second x the retransmission timeout, in the
+            quality metric's units per unit of stalled time. A rung with more packets
+            meets more losses, so on a lossy path the cheaper rung can be the better
+            one even when the link could carry the dearer one.
+
+On a path without loss both terms vanish and the controller is unchanged.
+
+Tuned on the 8 test clips outside the 10-clip tc netem evaluation (docs/COMPARISON.md):
+tcp_share 0.5 helped on both profiles; 1.0 did not; 0.35 was no better than 0.5. The
+stall price did not help beyond run-to-run noise at any weight tried (10, 25), so it is
+off by default (loss_weight 0).
 """
 from __future__ import annotations
 
@@ -35,6 +61,10 @@ from pathlib import Path
 from typing import NamedTuple
 
 from live.protocol import SCALE, parse_rung, rung_name
+
+# Quality thresholds are set in dB of PSNR; across this ladder 1 dB of PSNR is worth
+# about 6 points of VMAF (configs/rate_quality.json), so VMAF thresholds scale by it.
+METRIC_SCALE = {'psnr': 1.0, 'vmaf': 6.0}
 
 
 class Rung(NamedTuple):
@@ -183,10 +213,21 @@ class TradeoffController:
                  congestion_s: float = 0.04,
                  probe_s: float = 4.0, min_gain_db: float = 0.1, keyint: int = 30, rate_memory: int = 3,
                  up_hold_s: float = 2.0,
-                 tie_db: float = 0.05, deadline_s: float | None = None, gpu_aware: bool = True) -> None:
+                 tie_db: float = 0.05, deadline_s: float | None = None, gpu_aware: bool = True,
+                 metric: str = 'psnr', loss_aware: bool = False, loss_weight: float = 0.0,
+                 tcp_share: float = 0.5, loss_window: int = 10) -> None:
         missing = [name for name in ladder if name not in table]
         if missing:
             raise ValueError(f'rate-quality table has no entry for {missing}')
+        if metric not in METRIC_SCALE:
+            raise ValueError(f'metric must be one of {sorted(METRIC_SCALE)}')
+        if any(metric not in table[name] for name in ladder):
+            raise ValueError(f'rate-quality table has no {metric} column; re-run scripts/measure_rate_quality.py')
+        self.metric = metric
+        scale = METRIC_SCALE[metric]
+        min_gain_db, tie_db = min_gain_db * scale, tie_db * scale
+        self.loss_aware, self.loss_weight, self.tcp_share = loss_aware, loss_weight * scale, tcp_share
+        self.tcp: deque[dict] = deque(maxlen=loss_window + 1)  # the server's TCP counters, one per rate record
         self.table, self.policy = table, policy
         self.rungs = {name: Rung(*parse_rung(name)) for name in ladder}
         self.frame_interval, self.latency_budget_s = frame_interval, latency_budget_s
@@ -226,11 +267,49 @@ class TradeoffController:
             history.append(kbps)
             self.rates[name] = max(history)
         self.key_bytes.update(message.get('key_bytes', {}))
+        if message.get('tcp'):
+            self.tcp.append(message['tcp'])
 
     # Model of each rung -------------------------------------------------
 
     def rate(self, name: str) -> float:
         return self.rates.get(name, self.table[name]['kbps'])
+
+    def path_loss(self) -> float | None:
+        """Share of data segments retransmitted over the window; None until it covers
+        enough segments for the rate to mean anything."""
+        if len(self.tcp) < 2:
+            return None
+        sent = self.tcp[-1]['data_segs_out'] - self.tcp[0]['data_segs_out']
+        if sent < 200:
+            return None
+        return max(self.tcp[-1]['total_retrans'] - self.tcp[0]['total_retrans'], 0) / sent
+
+    def tcp_capacity(self) -> float | None:
+        """kbit/s: TCP's throughput ceiling at the measured loss rate and RTT (Mathis)."""
+        loss = self.path_loss()
+        if not loss or not self.tcp[-1]['rtt_us']:
+            return None
+        info = self.tcp[-1]
+        return info['mss'] * 8 * 1.2247 / (info['rtt_us'] / 1e6 * loss ** 0.5) / 1000
+
+    def usable_capacity(self) -> float | None:
+        """The link capacity, capped on a lossy path by a share of TCP's ceiling."""
+        ceiling = self.tcp_capacity() if self.loss_aware else None
+        if ceiling is None:
+            return self.capacity
+        ceiling *= self.tcp_share
+        return ceiling if self.capacity is None else min(self.capacity, ceiling)
+
+    def stall_cost(self, name: str) -> float:
+        """Quality lost to retransmission stalls on this rung (0 without loss)."""
+        loss = self.path_loss() if self.loss_aware else None
+        if not loss:
+            return 0.0
+        info = self.tcp[-1]
+        packets_per_s = 1 / self.frame_interval + self.rate(name) * 1000 / 8 / max(info['mss'], 536)
+        stalled = min(loss * packets_per_s * info['rto_us'] / 1e6, 1.0)
+        return self.loss_weight * stalled
 
     def exit_for(self, scale: int) -> int | None:
         """Deepest exit whose measured time fits the GPU share; None if none does."""
@@ -243,12 +322,12 @@ class TradeoffController:
         return max(fitting) if fitting else None
 
     def quality(self, name: str) -> float | None:
-        """Predicted PSNR, or None when the client cannot run this rung in time."""
-        rung, entry = self.rungs[name], self.table[name]
+        """Predicted quality (PSNR or VMAF), or None when the client cannot run this rung in time."""
+        rung, values = self.rungs[name], self.table[name][self.metric]
         if rung.scale == 1:
-            return entry['psnr'][0]
+            return values[0]
         exit_index = self.exit_for(rung.scale)
-        return None if exit_index is None else entry['psnr'][exit_index]
+        return None if exit_index is None else values[exit_index]
 
     def burst_fits(self, name: str) -> bool:
         """A keyframe of this rung crosses the link before the display deadline, so it
@@ -280,9 +359,11 @@ class TradeoffController:
         self._update_capacity()
         runnable = {name: q for name in self.rungs if (q := self.quality(name)) is not None}
         if not runnable:  # the model fits nowhere: direct rungs need no GPU
-            runnable = {n: self.table[n]['psnr'][0] for n, r in self.rungs.items() if r.scale == 1}
+            runnable = {n: self.table[n][self.metric][0] for n, r in self.rungs.items() if r.scale == 1}
         if not runnable:  # and the ladder has no direct rung: run the model anyway, late
-            runnable = {n: self.table[n]['psnr'][0] for n in self.rungs}
+            runnable = {n: self.table[n][self.metric][0] for n in self.rungs}
+        runnable = {n: q - self.stall_cost(n) for n, q in runnable.items()}
+        capacity = self.usable_capacity()
         options = {n: q for n, q in runnable.items() if self.burst_fits(n)}
         if not options:  # no keyframe fits the budget: the cheapest runnable rung
             cheapest = min(runnable, key=self.rate)
@@ -297,8 +378,8 @@ class TradeoffController:
         if draining:
             measured = self.capacity or self.monitor.delivery_kbps or self.rate(self.current)
             allowed, reason = 0.5 * measured, 'drain'
-        elif self.capacity is not None:
-            allowed, reason = self.headroom * self.capacity, 'capacity'
+        elif capacity is not None:
+            allowed, reason = self.headroom * capacity, 'capacity'
         else:
             allowed, reason = self.rate(self.current), 'hold'
             if now - self.changed_at >= self.probe_s and not self.congested:
@@ -308,7 +389,7 @@ class TradeoffController:
                     allowed, reason = self.rate(min(better, key=self.rate)), 'probe'
 
         fitting = {n: q for n, q in options.items() if self.rate(n) <= allowed}
-        if reason == 'capacity' and self.current in options and self.rate(self.current) <= self.stay_headroom * self.capacity:
+        if reason == 'capacity' and self.current in options and self.rate(self.current) <= self.stay_headroom * capacity:
             fitting[self.current] = options[self.current]  # hysteresis: keep a rung that still fits
         if not fitting:
             cheapest = min(options, key=self.rate)
@@ -335,8 +416,10 @@ class TradeoffController:
             self.skipped_at = now
         self.trace.append({'t': round(now, 3), 'to': choice, 'from': self.current, 'reason': reason, 'skip': skip,
                            'allowed_kbps': round(allowed, 1), 'rate_kbps': round(self.rate(choice), 1),
-                           'predicted_psnr': round(fitting[choice], 3),
+                           'predicted_quality': round(fitting[choice], 3),
                            'capacity_kbps': None if self.capacity is None else round(self.capacity, 1),
+                           'usable_kbps': None if capacity is None else round(capacity, 1),
+                           'loss': None if (loss := self.path_loss()) is None else round(loss, 4),
                            'queue_ms': round(self.monitor.queue_delay * 1000, 1),
                            'standing_ms': round(self.monitor.standing_queue * 1000, 1)})
         self.current, self.changed_at = choice, now
@@ -433,8 +516,8 @@ class MpcController(TradeoffController):
         self.predicted = throughput
         runnable = {name: q for name in self.rungs if (q := self.quality(name)) is not None}
         if not runnable:
-            runnable = {n: self.table[n]['psnr'][0] for n, r in self.rungs.items() if r.scale == 1} or \
-                       {n: self.table[n]['psnr'][0] for n in self.rungs}
+            runnable = {n: self.table[n][self.metric][0] for n, r in self.rungs.items() if r.scale == 1} or \
+                       {n: self.table[n][self.metric][0] for n in self.rungs}
         choice, qoe = self.plan(runnable, throughput, self.monitor.standing_queue)
         if choice == self.current:
             return None
@@ -442,7 +525,7 @@ class MpcController(TradeoffController):
             self.down_at = now
         self.trace.append({'t': round(now, 3), 'to': choice, 'from': self.current, 'reason': 'mpc', 'skip': False,
                            'throughput_kbps': round(throughput, 1), 'rate_kbps': round(self.rate(choice), 1),
-                           'predicted_psnr': round(runnable[choice], 3), 'qoe': round(qoe, 2),
+                           'predicted_quality': round(runnable[choice], 3), 'qoe': round(qoe, 2),
                            'capacity_kbps': None if self.capacity is None else round(self.capacity, 1),
                            'queue_ms': round(self.monitor.queue_delay * 1000, 1)})
         self.current, self.changed_at = choice, now

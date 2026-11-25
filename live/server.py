@@ -44,7 +44,7 @@ import av
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
-from live.backlog import backlog_bytes  # noqa: E402
+from live.backlog import backlog_bytes, tcp_path  # noqa: E402
 from live.link import EmulatedLink, parse_link  # noqa: E402
 from live.protocol import LABEL, RENDITIONS, Channel, Packet, parse_rung, rung_name  # noqa: E402
 from upstream_vsr.encoding import KEYINT, SIZES, frame_step, ladder_graph, x264_live  # noqa: E402
@@ -233,7 +233,7 @@ def serve(args: argparse.Namespace) -> dict:
                 if packet.keyframe and index > 0:
                     channel.send_json(b'R', {'frame': index, 'kbps': {
                         name: round(sum(sizes) * 8 * fps / len(sizes) / 1000, 1) for name, sizes in recent.items()},
-                        'key_bytes': key_bytes})
+                        'key_bytes': key_bytes, 'tcp': tcp_path(conn)})
                 channel.send_packet(packet)
                 previous_backlog = backlog_bytes(conn, link)  # including this packet
                 report['frames_by_rung'][current] = report['frames_by_rung'].get(current, 0) + 1
