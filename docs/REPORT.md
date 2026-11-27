@@ -41,11 +41,16 @@ Results:
   over the same ladder: +1.32 ± 0.44 dB, +7.4 VMAF and 33 ms lower p95 latency.
 - **Offline, the model leads on PSNR but not on perceptual metrics.** CDA-VSR and SPAN
   score higher VMAF at ×4, because UpStreamVSR was trained on a pixel loss.
-- **Over real TCP shaped with tc netem** (10 clips):
-  - Adaptive delivery beats RobustMPC by 1.4–1.8 dB and 720p-only delivery by 2.1–3.0 dB,
-    on a broadband profile and a mobile one.
-  - It does not beat fixed ×4 delivery significantly: +0.9 dB on broadband (not
-    significant), and level on mobile, where ×4 has the lower latency.
+- **Over real TCP shaped with tc netem** (10 clips), the controller caps its capacity
+  estimate by what TCP can carry at the measured loss and RTT:
+  - On a broadband profile it is the best mode: +1.0 dB over fixed ×4, +1.75 dB over
+    RobustMPC and +1.8 dB over 720p-only delivery (all significant).
+  - On a mobile profile (1% loss) it ties fixed ×4, which has fewer late frames. It
+    beats 720p-only delivery by 2.0 dB.
+  - The loss-aware cap adds 0.4 dB (broadband) and 0.9 dB (mobile) over the loss-blind
+    controller.
+  - A sender bug that froze lossy runs for seconds was found and fixed first, and all
+    real-TCP runs were repeated.
 - **Ablations** show that the sender's backlog guard is the largest single contribution
   (0.83 dB, and half the late frames).
 - **The recurrent memory**, borrowed from recent video super-resolution, added no
@@ -101,7 +106,9 @@ The goals were recorded in `docs/GOALS.md`:
 
 1. **A live streaming system** that chooses delivery (direct, ×2, ×4), compression level
    and model depth per frame. It does this from measured link capacity, measured GPU
-   time and a measured rate-quality table, and adds a sender-side backlog guard.
+   time and a measured rate-quality table, and adds a sender-side backlog guard. On
+   lossy paths it caps the link estimate by TCP's loss-limited rate, read from the
+   sender's TCP counters.
 2. **UpStreamVSR**, a 217k-parameter upscaler with:
    - compression-level conditioning;
    - anytime exits;
@@ -240,7 +247,20 @@ short queue, and 2 s since the last step down.
 - **Under congestion,** packets queue back to back, and the bytes divided by the
   arrival gaps give the capacity (packet dispersion).
 - **Expiry.** An estimate expires after 3 s, so a capacity measured before a change in
-  the link is not trusted for long.
+  the link is not trusted for long. The client then withdraws the estimate from the
+  server too, so the backlog guard (section 4.2) never acts on a stale rate. Before
+  this fix, a stale low estimate could make the guard skip all but keyframes, which
+  measure nothing, and the picture froze for 5–24 s on lossy paths.
+- **Loss and RTT** (`--loss-aware`). Over lossy TCP, the link's capacity overstates what
+  TCP delivers.
+  - The server attaches the sender's TCP counters (TCP_INFO: RTT, MSS, retransmitted and
+    sent segments) to each frame report.
+  - The controller computes the loss rate p, and the Mathis TCP ceiling
+    MSS · 8 · 1.22 / (RTT · √p).
+  - It plans with min(link capacity, 0.5 × ceiling). The factor 0.5 was tuned on clips
+    outside the evaluation set: TCP needs headroom over its average rate to meet a
+    deadline.
+  - With no loss the cap is off.
 - **Queuing delay** is split into the part a recent keyframe explains (harmless, it
   clears by itself) and the excess, which means the link has slowed.
 
@@ -399,6 +419,8 @@ One clip on the emulated link (2500 kbit/s, then 500 from 10 s, then 1500 from 2
   two profiles:
   - broadband: 20 ms one-way delay, 5 ms jitter, 0.1% loss;
   - mobile: 40 ms one-way delay, 15 ms jitter, 1% loss.
+  - Without root, `scripts/netem_unprivileged.sh` gives the harness its own user and
+    network namespaces. The TCP stack and the qdisc are the same as with sudo.
 - **Published models.** The four models were re-implemented, loaded with their authors'
   weights, checked against the authors' code, and run causally (one frame at a time).
   - NanoVSR's backward branch sees only the current frame.
@@ -537,37 +559,48 @@ Bold Δ: the interval excludes zero.
 - **The three-clip result was clip luck.** On three clips ×2 only led by 0.35 dB; on 18,
   PSNR is tied.
 
-Real TCP with tc netem, **10 clips** (adaptive minus mode, paired by clip, ± 95% CI;
-clips adaptive wins; bold: the interval excludes zero):
+Real TCP with tc netem, **10 clips**, comparing the loss-aware controller with each
+mode (paired by clip, ± 95% CI; clips it wins; bold: the interval excludes zero):
 
 ![tc netem](figures/netem.png)
 
 | vs | Broadband PSNR dB | Broadband VMAF | Mobile PSNR dB | Mobile VMAF |
 |---|---:|---:|---:|---:|
-| direct only | **+2.14 ± 1.61** (8/10) | **+6.7 ± 4.8** | **+2.97 ± 2.06** (7/10) | **+6.4 ± 5.6** |
-| ×2 only | +1.76 ± 2.27 (6/10) | +2.6 ± 8.0 | +1.56 ± 2.03 (6/10) | −1.3 ± 5.4 |
-| ×4 only | +0.86 ± 1.04 (7/10) | **+7.1 ± 4.0** | −0.04 ± 0.60 (5/10) | +1.4 ± 3.1 |
-| RobustMPC, full ladder | **+1.83 ± 0.77** (9/10) | **+10.0 ± 3.7** | **+1.44 ± 0.86** (9/10) | **+5.8 ± 5.4** |
-| RobustMPC, direct only | **+3.77 ± 2.28** (9/10) | **+13.9 ± 8.0** | **+2.92 ± 2.27** (8/10) | +6.5 ± 7.8 |
-| *adaptive itself* | *30.07 dB* | *61.1* | *27.19 dB* | *46.0* |
+| adaptive, loss-blind | **+0.42 ± 0.41** (7/10) | **+1.7 ± 1.5** | **+0.86 ± 0.74** (7/10) | +3.2 ± 3.3 |
+| direct only | **+1.77 ± 1.49** (8/10) | **+6.9 ± 4.8** | **+2.04 ± 1.59** (7/10) | +5.3 ± 6.1 |
+| ×2 only | +0.80 ± 0.96 (7/10) | −0.5 ± 3.4 | **+1.34 ± 1.24** (7/10) | −1.1 ± 4.5 |
+| ×4 only | **+1.01 ± 0.82** (8/10) | **+8.2 ± 3.8** | −0.28 ± 1.07 (4/10) | +1.4 ± 4.1 |
+| RobustMPC, full ladder | **+1.75 ± 0.99** (9/10) | **+9.2 ± 5.3** | +0.75 ± 1.30 (7/10) | +2.8 ± 3.9 |
+| RobustMPC, direct only | **+3.55 ± 1.84** (9/10) | **+14.5 ± 6.9** | **+1.98 ± 1.32** (8/10) | +3.5 ± 5.2 |
+| *loss-aware adaptive itself* | *30.26 dB* | *62.3* | *27.42 dB* | *46.9* |
 
-- **Adaptive clearly beats RobustMPC and 720p delivery on both profiles.** The MPC gap
-  is larger here than on the emulated link (+1.32 dB). Over TCP, MPC's lagging estimate
-  and missing backlog guard cost more, and its longest freeze is 1.7–2.5 s longer.
-- **×4 only is not beaten.**
-  - On broadband, adaptive leads in VMAF and LPIPS, but its PSNR lead (+0.86 dB) is not
-    significant.
-  - On mobile, the two tie on every quality metric.
-  - ×4 only, the smallest stream, has the fewest late and skipped frames and the
-    shortest freezes on both profiles. On mobile, adaptive has 87 more late and skipped
-    frames and a 39 ms higher p95 latency.
-- **×2 only** is behind on average (1.6–1.8 dB), but it varies too much across clips
-  for significance.
-- **Why real TCP hurts fixed modes:** a lost packet stalls everything behind it, so
-  rates that fit on an emulated link overflow the deadline.
-- **This revises the three-clip run** (below), where adaptive beat every fixed mode.
-  On a lossy path, always sending the smallest stream is a strong policy, and the
-  controller still pays in late frames when it moves to larger streams.
+- **A bug was found first.**
+  - In the first 10-clip netem run, 49 of 160 runs froze for 5–24 s. A stale low
+    capacity estimate kept the backlog guard skipping every frame but the keyframes, and
+    one keyframe a second could not correct the estimate.
+  - The fix withdraws an estimate older than 3 s (section 4.3).
+  - All real-TCP runs were then repeated with eight modes. That gives 160 runs, all with
+    a healthy CPU and encoder. These are the numbers here (docs/COMPARISON.md).
+- **On broadband the loss-aware controller is the best mode.** It is ahead of everything
+  except ×2 only, where +0.8 dB is not significant. Its leads are +1.0 dB and 8 VMAF
+  over ×4 only, and +1.75 dB over RobustMPC.
+- **On mobile (80 ms RTT, 1% loss), it ties ×4 only.** It is −0.3 ± 1.1 dB in PSNR and
+  level in VMAF and LPIPS, and ×4 only still has fewer late frames. It clearly beats
+  720p delivery and ×2 only. Against RobustMPC, its +0.75 dB lead is not significant.
+- **Without the loss cap the controller is weaker than the first run suggested.** On
+  mobile it is 1.1 ± 1.0 dB behind ×4 only and level with RobustMPC. The fix helped the
+  fixed modes most, because their larger streams hit the lock more often.
+- **Why real TCP needs the cap:** a lost packet stalls everything behind it, and TCP's
+  window halves at each loss. A rate that fits the link's capacity can still miss the
+  deadline, so the controller plans with what TCP can carry, not what the link can.
+- **A VMAF-driven controller was tried and did not help.** It ran with the quality
+  table in VMAF instead of PSNR (`--quality-metric vmaf`).
+  - On the emulated link it moved frames from direct to ×4, but scored no better in
+    VMAF: 62.6 against 63.0 for the PSNR-driven controller, not significant.
+  - Over netem it was 0.5–0.8 dB behind the PSNR-driven loss-aware controller (not
+    significant).
+  - The table predicts a rung's quality when its frames arrive in time. The viewer's
+    VMAF is dominated by held frames, which cost the same under either metric.
 
 The earlier three-clip run, for reference:
 
@@ -657,11 +690,14 @@ another process holding the GPU at 98% utilisation.
   more clips:
   - the margin over the published models;
   - ×2 only beating adaptive on the emulated link;
-  - adaptive beating ×4 only over real TCP.
-- **On lossy paths, the controller should be more cautious.** Over tc netem, fixed ×4
-  matches it in quality with fewer late frames. A capacity estimate that accounts for
-  loss and RTT, or a tighter latency budget on lossy links, is the next controller
-  change to try.
+  - adaptive beating ×4 only over real TCP (the loss-blind controller trails it on
+    mobile; the loss-aware one ties it).
+- **On lossy paths, the controller must plan with TCP's rate, not the link's.** Capping
+  the estimate at half the Mathis TCP ceiling made it the best mode over broadband TCP,
+  and level with fixed ×4 on the 1%-loss mobile path. There, always sending the
+  smallest stream remains as good as any controller tested, with fewer late frames.
+- **Long runs on real paths find bugs that emulation hides.** The stale-estimate lock
+  never showed on the emulated link. It needed loss bursts and long RTTs to trigger.
   Paired confidence intervals over clips should be the default.
 - **The bandwidth case for upscaling is real but bounded.** Below about 1 Mbit/s,
   sending fewer pixels and upscaling wins; above that, direct wins. The controller's job
@@ -679,18 +715,20 @@ another process holding the GPU at 98% utilisation.
 - **Metrics:** PSNR, VMAF and LPIPS, but no user study.
   - The model was trained for PSNR, and it trails CDA-VSR and SPAN on perceptual
     metrics offline.
-  - The controller's quality table is in PSNR.
+  - The controller's quality table is in PSNR. A VMAF table was tried and did not help.
 - **Baselines:** the published models were adapted to run causally and were not
   fine-tuned on StreamSR.
 - **Output resolution:** 720p only.
 
 ## 10. Future work
 
-- A perceptual term (LPIPS or a feature loss) in fine-tuning, and a quality table in
-  VMAF for the controller.
+- A perceptual term (LPIPS or a feature loss) in fine-tuning. Changing only the
+  controller's metric to VMAF did not help, so a perceptual gain has to come from the
+  model.
 - A small user study.
-- A loss- and RTT-aware capacity estimate for the controller, to close the gap to fixed
-  ×4 delivery on lossy paths.
+- Pricing late frames on lossy paths, so the controller matches fixed ×4's late-frame
+  count on mobile. A stall price per rung was tried, with no gain over the capacity cap
+  alone.
 - A weaker GPU, where anytime depth and GPU awareness should matter.
 - Fine-tuning the published models on StreamSR, for a stricter comparison.
 - 1080p output.
@@ -709,7 +747,8 @@ The 217k-parameter UpStreamVSR beats four recent published models in PSNR at eve
 bitrate tested, while running fast enough to make ×2 and ×4 delivery usable live. Inside the
 adaptive system, it gives 0.6–1.0 dB higher viewer PSNR than those models on 18 clips,
 at roughly 60% of their GPU power. The trade-off controller beats RobustMPC over the
-same ladder by 1.3 dB. On perceptual metrics the offline lead does not hold; that is
+same ladder by 1.3 dB, and, planning with TCP's loss-limited rate, is the best mode over
+broadband TCP and level with fixed ×4 on a 1%-loss mobile path. On perceptual metrics the offline lead does not hold; that is
 the clearest next step.
 
 ## References

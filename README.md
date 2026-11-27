@@ -33,7 +33,7 @@ All results are measured on an NVIDIA RTX 3050 Laptop GPU (4 GB).
 | The same models in the live pipeline, same controller, 18 clips | **+0.57 to +1.00 dB** viewer PSNR and **+1.9 to +11.9 VMAF** (all significant at 95%), at 56–66% of their GPU power. UpStreamVSR is the only one fast enough for ×2 live. |
 | Against RobustMPC, a standard ABR controller, same ladder, 18 clips | **+1.32 ± 0.44 dB** viewer PSNR, +7.4 VMAF, 33 ms lower p95 latency, half the longest freeze. |
 | Adaptive vs fixed delivery, emulated link, 18 clips | Ahead of ×4-only on every metric (18/18 clips in PSNR); ahead of direct-only in VMAF (+3.9). Tied with ×2-only in PSNR but 2.7 VMAF behind it; less latency and GPU time. |
-| Over real TCP (tc netem), 10 clips | Adaptive beats RobustMPC by **+1.83 dB** (broadband) and **+1.44 dB** (mobile), and direct-only by +2.1 to +3.0 dB. Level with ×4-only (+0.86 dB broadband, not significant; −0.04 dB mobile), which has fewer late frames. |
+| Over real TCP (tc netem), 10 clips | With its loss-aware capacity cap, the controller is the best mode on broadband: **+1.0 dB** over ×4-only, **+1.75 dB** over RobustMPC, +1.8 dB over direct-only. On the 1%-loss mobile profile it ties ×4-only (−0.28 ± 1.07 dB), which has fewer late frames, and beats direct-only by 2.0 dB. |
 | Bandwidth | For the same PSNR, ×4 + UpStreamVSR needs about 30% fewer bits than direct 720p (BD-rate −28.7%). |
 | Stability | A 5-minute live run held 30 fps, with a flat 155 ms median display latency. |
 
@@ -106,7 +106,7 @@ Reproducing the results:
 |---|---|---|
 | Rate-quality table | `python scripts/measure_rate_quality.py --checkpoint <ckpt>` | [CONTROLLER.md](docs/CONTROLLER.md) |
 | Live comparison of delivery modes | `python scripts/compare_modes.py <clips> --half` | [COMPARISON.md](docs/COMPARISON.md) |
-| Real-network comparison | `sudo bash scripts/run_netem.sh multi` (10 clips) | [COMPARISON.md](docs/COMPARISON.md) |
+| Real-network comparison | `sudo bash scripts/run_netem.sh multi` (10 clips), or without sudo through `scripts/netem_unprivileged.sh` | [COMPARISON.md](docs/COMPARISON.md) |
 | Published models, offline | `python scripts/benchmark_baselines.py --half` | [BASELINES.md](docs/BASELINES.md) |
 | Ablations | `python scripts/compare_modes.py <clips> --modes adaptive adaptive-bicubic ...` | [ABLATION.md](docs/ABLATION.md) |
 | Training (Kaggle) | `kaggle/1_prepare_data.ipynb`, then `kaggle/2b_train_no_state.ipynb` | [MODEL.md](docs/MODEL.md) |
@@ -133,7 +133,7 @@ loads them from `$UPSTREAM_EXTERNAL` (default `~/Github/btp-vsr/external`).
 
 - One laptop GPU.
 - Emulated-link and offline comparisons use 18 clips × 30 s; the tc netem runs use 10 clips.
-- Over lossy real TCP, the controller does not beat always sending ×4.
+- On the 1%-loss mobile path, the controller only ties always sending ×4, which has fewer late frames.
 - The networks are emulated, or shaped with tc netem on one machine.
 - Quality is measured in PSNR, VMAF and LPIPS, with no user study. The model and the
   controller are tuned for PSNR, which costs them on the perceptual metrics.

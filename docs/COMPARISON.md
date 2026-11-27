@@ -540,6 +540,9 @@ python scripts/summarise_clips.py results/multiclip/summary.json --json results/
 
 ## tc netem on 10 clips, with confidence intervals and RobustMPC (2026-11-25)
 
+> **Superseded** by the re-run of 2026-11-27 at the end of this file. These runs were
+> distorted by a backlog-guard bug; the numbers below are kept for the record.
+
 `sudo bash scripts/run_netem.sh multi`. The first 10 test clips run over real TCP
 shaped with tc netem. Same profiles and rate schedule as above; modes direct, x2, x4,
 adaptive, mpc and mpc-direct; final model (results/multiclip-netem-broadband,
@@ -608,3 +611,181 @@ Adaptive itself: 30.07 ± 2.56 dB on broadband and 27.19 ± 2.33 dB on mobile.
   - make the capacity estimate account for loss and RTT, so the controller reacts to
     TCP's effective rate;
   - lower the latency budget on lossy paths.
+
+## tc netem re-run after the guard fix, with a loss-aware controller (2026-11-27)
+
+This section replaces the real-TCP numbers of 2026-11-25 above. Those runs were
+distorted by a bug, described below. The emulated-link results are not affected: the
+bug needs a lossy path to trigger, and the emulated runs are essentially free of it.
+
+### The bug: the backlog guard could lock on a stale estimate
+
+- **The client reported capacity only when it changed** (a C record when the estimate
+  moved by more than 10%).
+- **A low estimate could therefore stay in force indefinitely.** After a loss burst, the
+  server's backlog guard compared the send backlog with that stale low rate and skipped
+  every frame of each GOP except its keyframe.
+- **One keyframe per second measures nothing**, so the estimate never recovered, and the
+  picture froze for 5–24 s although the link had room again.
+- **Seen in 49 of the 160 earlier netem runs**, in every mode that uses the guard,
+  including adaptive.
+- **The fix (commit 75fb9f4):** the controller records when its estimate was last
+  measured. If that is more than 3 s ago, the client withdraws the estimate (sends
+  `kbps: null`), and the guard stands down until a fresh measurement arrives. The
+  withdrawals are logged per run (`capacity_withdrawn` in client.json).
+- Checked first on E9Bmp_Ce8zI, direct, mobile. The longest run of guard skips fell
+  from 15 GOPs to 4.
+
+### The loss-aware controller (`adaptive-loss`)
+
+Over lossy TCP the link capacity is not what TCP can carry: every loss halves the
+congestion window. The controller now reads the sender's TCP counters (TCP_INFO: RTT,
+MSS, retransmitted and sent segments; `live/backlog.py:tcp_path`), which the server
+attaches to each per-frame report.
+
+- **Loss rate:** retransmitted / sent segments over the last 10 reports, once at
+  least 200 segments have been sent.
+- **TCP ceiling** (Mathis et al.): MSS · 8 · 1.22 / (RTT · √p).
+- **Usable capacity** = min(link estimate, share × ceiling), with share = 0.5. It
+  replaces the link estimate in the controller's capacity check and hysteresis.
+- With no loss, the cap is off, and the controller is exactly the old one. The
+  emulated-link results are unchanged.
+
+**Tuning used only the 8 test clips outside the evaluation set** (qZlk, QZVq, rPDr,
+UkR0, vT7X, W-8c, X1y2, xxAE; results/tune-netem-*). These runs predate the guard fix,
+so they are noisier than the final runs.
+
+| Setting (mobile unless noted) | PSNR gain over adaptive, dB |
+|---|---:|
+| share 0.5, no stall price | +1.59 ± 1.76; repeated: +0.58 ± 2.45 |
+| share 0.5, broadband | +0.47 ± 0.60 |
+| share 0.35 | +0.85 ± 1.00 (mobile), +0.38 ± 0.83 (broadband) |
+| share 1.0 (the raw Mathis rate), stall price 10 | −0.34 ± 1.67 |
+| share 0.5, stall price 10 / 25 | +0.59 / +1.09 |
+
+- **Share 0.5 was kept.** A smaller share was no better, and the raw Mathis rate did not
+  help: TCP needs headroom over its average rate to meet a deadline.
+- **A stall price was tried and dropped.** It subtracts the expected cost of a
+  retransmission timeout from each rung's predicted quality; it gave no gain over the cap
+  alone (`--loss-weight`, default 0).
+- **Two identical runs differed by 1 dB** on mobile, which sets the noise level here.
+
+### The VMAF-driven controller (`--quality-metric vmaf`): a negative result
+
+The controller's quality table (configs/rate_quality.json) now also has a VMAF column
+per rung (`scripts/measure_rate_quality.py`). With `--quality-metric vmaf` it maximises
+predicted VMAF; its thresholds are scaled by 6 VMAF points per dB.
+
+- **Emulated link, 18 clips** (adaptive-vmaf-loss; the loss cap is inactive there):
+  30.65 dB / 62.6 VMAF against adaptive's 30.84 dB / 63.0 VMAF. Neither difference is
+  significant (Δ +0.19 ± 0.33 dB, +0.4 ± 1.2 VMAF).
+  - It uses 6% more bits and 2.2 points more model GPU time.
+  - It moves direct from 28% of frames to 13%, and ×4 from 26% to 36%.
+  - It does not reach ×2 only's VMAF (65.7). The 2.7-point gap to ×2 only stays.
+- **tc netem, 10 clips:** it is behind adaptive-loss on both profiles (−0.50 and
+  −0.84 dB, −2.4 and −3.5 VMAF, not significant), even on VMAF itself.
+- **Why it fails:** the table's VMAF predicts a rung's quality when its frames arrive.
+  The viewer's VMAF is set by held frames when they do not, and that cost is the same
+  under either metric. Choosing the metric changes too little to show.
+
+### Setup and validity
+
+- **Runs:** 8 modes × 10 clips × 2 profiles = 160 runs. The modes are direct, x2, x4,
+  adaptive, mpc, mpc-direct, adaptive-loss and adaptive-vmaf-loss. Same clips, profiles
+  and rate schedule as on 2026-11-25. Results are in
+  results/multiclip-netem-v2-broadband and results/multiclip-netem-v2-mobile.
+- **No sudo:** the runs used `scripts/netem_unprivileged.sh`, which starts the harness
+  in its own user, mount and network namespaces. The kernel TCP stack and tc netem are
+  the same.
+  - Spot checks against the sudo runs agreed within the run-to-run noise (1–2 dB).
+- **All 160 runs are healthy:**
+  - CPU at 3.5 GHz or more;
+  - load below 8 before each run;
+  - encoder lag below 0.5 s;
+  - no client errors.
+- **Withdrawals:** the client withdrew its estimate 38 times over the 80 broadband runs
+  and 102 times over the 80 mobile runs.
+- **Long freezes remain only where expected:**
+  - No adaptive variant froze for more than 5.2 s.
+  - Freezes of more than 5 s were in direct, mpc-direct, mpc and x2 runs, mostly within
+    the 10 s at 500 kbit/s. A 720p rung cannot fit there.
+
+### Results: loss-aware adaptive against every mode
+
+adaptive-loss minus each mode, paired by clip, ± 95% CI. The count in brackets is the
+clips adaptive-loss wins. Bold: the interval excludes zero.
+
+| Profile | vs | Viewer PSNR dB | VMAF | LPIPS | Late + skipped |
+|---|---|---:|---:|---:|---:|
+| broadband | direct | **+1.77 ± 1.49** (8/10) | **+6.9 ± 4.8** | **−0.048 ± 0.039** | **−95 ± 86** |
+| broadband | x2 | +0.80 ± 0.96 (7/10) | −0.5 ± 3.4 | −0.012 ± 0.020 | −44 ± 77 |
+| broadband | x4 | **+1.01 ± 0.82** (8/10) | **+8.2 ± 3.8** | **−0.026 ± 0.018** | **+84 ± 36** |
+| broadband | adaptive | **+0.42 ± 0.41** (7/10) | **+1.7 ± 1.5** | −0.011 ± 0.011 | −9 ± 28 |
+| broadband | mpc | **+1.75 ± 0.99** (9/10) | **+9.2 ± 5.3** | **−0.048 ± 0.025** | −50 ± 63 |
+| broadband | mpc-direct | **+3.55 ± 1.84** (9/10) | **+14.5 ± 6.9** | **−0.098 ± 0.055** | **−141 ± 89** |
+| broadband | adaptive-vmaf-loss | +0.50 ± 0.63 (9/10) | +2.4 ± 3.2 | −0.015 ± 0.016 | −13 ± 38 |
+| mobile | direct | **+2.04 ± 1.59** (7/10) | +5.3 ± 6.1 | −0.041 ± 0.043 | **−134 ± 87** |
+| mobile | x2 | **+1.34 ± 1.24** (7/10) | −1.1 ± 4.5 | −0.004 ± 0.033 | **−136 ± 72** |
+| mobile | x4 | −0.28 ± 1.07 (4/10) | +1.4 ± 4.1 | +0.006 ± 0.024 | +55 ± 61 |
+| mobile | adaptive | **+0.86 ± 0.74** (7/10) | +3.2 ± 3.3 | −0.018 ± 0.023 | −48 ± 51 |
+| mobile | mpc | +0.75 ± 1.30 (7/10) | +2.8 ± 3.9 | −0.006 ± 0.034 | −33 ± 65 |
+| mobile | mpc-direct | **+1.98 ± 1.32** (8/10) | +3.5 ± 5.2 | −0.033 ± 0.044 | **−120 ± 64** |
+| mobile | adaptive-vmaf-loss | +0.84 ± 1.45 (7/10) | +3.5 ± 6.0 | −0.016 ± 0.035 | −51 ± 81 |
+
+adaptive-loss itself: 30.26 ± 2.57 dB / 62.3 VMAF on broadband and 27.42 ± 2.57 dB /
+46.9 VMAF on mobile.
+
+The old controller (adaptive) minus each mode, for comparison with 2026-11-25
+(results/multiclip-netem-v2-*/ci.md):
+
+| Profile | vs | Viewer PSNR dB | VMAF |
+|---|---|---:|---:|
+| broadband | direct | +1.35 ± 1.54 (7/10) | **+5.2 ± 4.4** |
+| broadband | x2 | +0.38 ± 1.09 (5/10) | −2.2 ± 3.8 |
+| broadband | x4 | +0.59 ± 0.83 (7/10) | **+6.5 ± 3.8** |
+| broadband | mpc | **+1.33 ± 0.94** (9/10) | **+7.5 ± 4.5** |
+| mobile | direct | +1.18 ± 1.51 (7/10) | +2.1 ± 4.2 |
+| mobile | x2 | +0.48 ± 1.14 (6/10) | **−4.3 ± 3.5** |
+| mobile | x4 | **−1.14 ± 0.98** (1/10) | −1.8 ± 5.0 |
+| mobile | mpc | −0.11 ± 1.20 (5/10) | −0.4 ± 2.8 |
+
+### What the re-run shows
+
+- **The loss-aware cap is what makes the controller work over lossy TCP.** It beats the
+  old controller on both profiles: +0.42 ± 0.41 dB on broadband and +0.86 ± 0.74 dB on
+  mobile. On broadband it also leads in VMAF, by 1.7 ± 1.5.
+- **On broadband it is the best mode.** It is significantly ahead of everything except
+  ×2 only (+0.80 ± 0.96 dB, not significant), including ×4 only (+1.01 dB, +8.2 VMAF)
+  and RobustMPC (+1.75 dB, +9.2 VMAF).
+- **On mobile it ties ×4 only** (−0.28 ± 1.07 dB, VMAF +1.4, not significant). ×4 only
+  still has fewer late and skipped frames. It is clearly ahead of 720p delivery, with or
+  without MPC, and of ×2 only. Its lead over RobustMPC (+0.75 ± 1.30 dB) is not
+  significant.
+- **The old controller is worse than these runs first suggested.**
+  - On mobile it is now 1.14 ± 0.98 dB behind ×4 only, where 2026-11-25 had a tie.
+  - Its lead over RobustMPC is +1.33 dB on broadband (was +1.83) and gone on mobile
+    (was +1.44).
+  - The fix helped the fixed modes and MPC more than adaptive, because their larger
+    streams ran into the stale-estimate lock more often. Per mode, v2 minus v1 is −0.6
+    to +1.6 dB, mostly inside the noise. Direct, mobile gained most: +1.15 ± 1.13 dB.
+- **What remains:**
+  - On the mobile path (80 ms RTT, 1% loss), always sending the smallest stream is still
+    as good as any controller tested.
+  - The loss-aware cap closes the gap to ×4 only in quality, but not in late frames.
+
+### Reproduce
+
+```bash
+# without sudo; with sudo, drop the wrapper
+MODES="direct x2 x4 adaptive mpc mpc-direct adaptive-loss adaptive-vmaf-loss"
+bash scripts/netem_unprivileged.sh "$PYTHON" scripts/compare_modes.py <10 eval clips> \
+    --modes $MODES --half --netem --resume \
+    --path delay=20,jitter=5,loss=0.1,limit=300 --out results/multiclip-netem-v2-broadband
+bash scripts/netem_unprivileged.sh "$PYTHON" scripts/compare_modes.py <10 eval clips> \
+    --modes $MODES --half --netem --resume \
+    --path delay=40,jitter=15,loss=1,limit=300 --out results/multiclip-netem-v2-mobile
+for p in broadband mobile; do
+  python scripts/summarise_clips.py results/multiclip-netem-v2-$p/summary.json \
+      --json results/multiclip-netem-v2-$p/ci.json --markdown results/multiclip-netem-v2-$p/ci.md
+done
+```

@@ -8,7 +8,7 @@ Needs only matplotlib and numpy (any Python with them, for example the system on
 Inputs: configs/rate_quality.json, results/baselines/offline.json,
 results/no-state/offline.json, results/final/baselines-live/summary.json,
 results/final/compare/summary.json, results/multiclip/ci.json,
-results/multiclip-netem-*/ci.json.
+results/multiclip-netem-v2-*/ci-loss.json.
 """
 from __future__ import annotations
 
@@ -191,16 +191,16 @@ def forest(ax, ci: dict, rows: list[tuple[str, str]], metric: str, digits: int) 
 
 
 def netem() -> None:
-    rows = [('x4', 'x4 only'), ('x2', 'x2 only'), ('direct', 'Direct only'), ('mpc', 'RobustMPC, full ladder'),
-            ('mpc-direct', 'RobustMPC, direct only')][::-1]
-    fig, axes = plt.subplots(1, 2, figsize=(9, 3.4), sharey=True)
+    rows = [('adaptive', 'Adaptive, loss-blind'), ('x4', 'x4 only'), ('x2', 'x2 only'), ('direct', 'Direct only'),
+            ('mpc', 'RobustMPC, full ladder'), ('mpc-direct', 'RobustMPC, direct only')][::-1]
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.8), sharey=True)
     for ax, profile, title in ((axes[0], 'broadband', 'Broadband (40 ms RTT, 0.1% loss)'),
                                (axes[1], 'mobile', 'Mobile (80 ms RTT, 1% loss)')):
-        forest(ax, load(f'results/multiclip-netem-{profile}/ci.json')['modes'], rows, 'viewer_psnr', 2)
+        forest(ax, load(f'results/multiclip-netem-v2-{profile}/ci-loss.json')['modes'], rows, 'viewer_psnr', 2)
         ax.set_title(title)
-        ax.set_xlabel('Adaptive minus mode, viewer PSNR dB')
+        ax.set_xlabel('Loss-aware adaptive minus mode, PSNR dB')
     axes[0].set_yticks(range(len(rows)), [label for _, label in rows])
-    fig.suptitle('Real TCP with tc netem, 10 clips, paired 95% intervals. Blue: adaptive better; gray: not significant',
+    fig.suptitle('Real TCP with tc netem, 10 clips, paired 95% intervals. Blue: loss-aware adaptive better; gray: not significant',
                  x=0.01, ha='left', fontsize=10, fontweight='bold', color=INK)
     fig.tight_layout()
     fig.savefig(OUT / 'netem.png', dpi=160)

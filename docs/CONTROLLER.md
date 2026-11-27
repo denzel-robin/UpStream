@@ -118,6 +118,31 @@ Variants that failed and were removed:
 - **Counting a record as queued until its last byte left** in the emulated link. A
   socket's send queue shrinks as bytes leave; the link now counts only what is left of
   the record on the wire.
+- **Keeping a stale estimate.** The client sent a C record only when its estimate
+  changed. After a loss burst on real TCP, a low estimate could stay in force; the
+  guard then dropped every group but its keyframe, and one keyframe a second could not
+  correct the estimate. The picture froze for 5 to 24 s, in 49 of 160 tc netem runs.
+  Now an estimate not measured for 3 s is withdrawn (`kbps: null`), and the guard
+  stands down until a fresh measurement arrives (`TradeoffController.fresh_capacity`).
+
+### Lossy paths and the quality metric
+
+Two client options (`live/client.py`), both evaluated in docs/COMPARISON.md:
+
+- **`--loss-aware`** caps the capacity by what TCP can carry.
+  - The server attaches the sender's TCP_INFO (RTT, MSS, retransmitted and sent
+    segments; `live/backlog.py:tcp_path`) to each frame report.
+  - The controller takes the loss rate over the last 10 reports, once 200 segments have
+    been sent. It plans with min(link capacity, `--tcp-share` × Mathis ceiling).
+  - The Mathis ceiling is MSS · 8 · 1.22 / (RTT · √p). The share defaults to 0.5.
+  - `--loss-weight` adds a stall price per rung, the expected cost of a retransmission
+    timeout. It is 0 by default, because it gave no gain over the cap.
+  - Without loss, nothing changes.
+  - Over tc netem this adds 0.4 dB (broadband) and 0.9 dB (mobile). It is the mode
+    `adaptive-loss` in `scripts/compare_modes.py`.
+- **`--quality-metric vmaf`** maximises the table's VMAF column instead of PSNR. Its
+  thresholds are scaled by 6 VMAF points per dB. It did not raise viewer VMAF, on the
+  emulated link or over netem.
 
 ### Why each rendition gets chosen
 
@@ -209,7 +234,7 @@ is the worst case of switching on keyframes.
 
 ## Limits
 
-- One machine, emulated link without propagation delay or loss; tc netem in milestone 5.
+- One machine, emulated link without propagation delay or loss; tc netem results are in docs/COMPARISON.md.
 - Quality is predicted from the table's means, not measured live (the client has no
   reference). Milestone 5 measures it from recorded output.
 - The keyframe interval (1 s) bounds how fast a switch takes effect; a shorter one
