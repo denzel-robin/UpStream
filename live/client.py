@@ -234,7 +234,7 @@ def run(args: argparse.Namespace) -> dict:
         raise SystemExit('use --schedule or --controller, not both')
     report = {'checkpoint': str(args.checkpoint) if args.checkpoint else None, 'half': args.half,
               'playout_delay_s': args.playout_delay, 'drop_late_s': args.drop_late,
-              'schedule': schedule, 'frames': [], 'errors': [], 'skipped': 0, 'guard': [],
+              'schedule': schedule, 'frames': [], 'errors': [], 'skipped': 0, 'guard': [], 'capacity_withdrawn': [],
               'ablation': {'upscaler': args.upscaler, 'fixed_exit': args.fixed_exit, 'gpu_aware': args.gpu_aware}}
     policy = None
     baseline = Baseline(args.upscaler, device, args.half) if args.upscaler in BASELINES else None
@@ -302,7 +302,7 @@ def run(args: argparse.Namespace) -> dict:
         return threading.Thread(target=wrapper, name=name, daemon=True)
 
     received = [0]
-    reported = [1e-9]  # capacity last sent to the server
+    reported: list[float | None] = [None]  # capacity last sent to the server (None: none, or withdrawn)
 
     def receive():
         while True:
@@ -334,10 +334,14 @@ def run(args: argparse.Namespace) -> dict:
                 controller.observe_packet(packet.sent, arrived, len(packet.data), packet.keyframe)
                 if (decision := controller.decide(arrived)) is not None:
                     channel.send_json(b'S', {'rung': decision[0], 'skip': decision[2]})
-                if controller.capacity and abs(controller.capacity - reported[0]) > 0.1 * reported[0]:
-                    reported[0] = controller.capacity
+                fresh = controller.fresh_capacity(arrived)
+                if (fresh is None) != (reported[0] is None) or (
+                        fresh is not None and abs(fresh - reported[0]) > 0.1 * reported[0]):
+                    if fresh is None:  # stale: withdraw it, so the guard cannot lock on it
+                        report['capacity_withdrawn'].append(round(arrived - anchor[0], 3))
+                    reported[0] = fresh
                     # The server's guard drops only frames that would arrive too late to be shown.
-                    channel.send_json(b'C', {'kbps': round(controller.capacity, 1), 'budget_ms': round(
+                    channel.send_json(b'C', {'kbps': None if fresh is None else round(fresh, 1), 'budget_ms': round(
                         (args.playout_delay + args.drop_late - args.processing_margin) * 1000, 1)})
             packets.put((packet, arrived))
 

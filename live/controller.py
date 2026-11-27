@@ -247,6 +247,7 @@ class TradeoffController:
         self.down_at = float('-inf')
         self.key_bytes: dict[str, int] = {}
         self.capacity: float | None = None  # kbit/s, measured while the link was the bottleneck
+        self.capacity_at = float('-inf')  # when it was last measured (packet arrival time)
         self.congested = False
         self.current: str | None = None
         self.changed_at = 0.0
@@ -269,6 +270,19 @@ class TradeoffController:
         self.key_bytes.update(message.get('key_bytes', {}))
         if message.get('tcp'):
             self.tcp.append(message['tcp'])
+
+    def fresh_capacity(self, now: float, max_age_s: float = 3.0) -> float | None:
+        """The capacity, or None when nothing has measured it for max_age_s.
+
+        The server's backlog guard divides its queue by this. After a stall the last
+        estimate can be far too low, the guard then skips every group of pictures but
+        its keyframe, and one packet a second is too few to measure anything: the
+        estimate never recovers and the picture freezes for tens of seconds (seen over
+        tc netem in every mode). A stale estimate is withdrawn instead, so the server
+        sends again and the packets measure the link afresh."""
+        if self.capacity is None or now - self.capacity_at > max_age_s:
+            return None
+        return self.capacity
 
     # Model of each rung -------------------------------------------------
 
@@ -344,11 +358,12 @@ class TradeoffController:
             if not self.congested:
                 self.monitor.forget_idle()
             self.congested = True
-            self.capacity = measured
+            self.capacity, self.capacity_at = measured, self.monitor.latest
         elif self.monitor.standing_queue < self.congestion_s / 2:
             self.congested = False
             if self.monitor.idle_capacity is not None:
-                self.capacity = self.monitor.idle_capacity
+                # stamped with the fit's own time: an old fit is not a fresh measurement
+                self.capacity, self.capacity_at = self.monitor.idle_capacity, self.monitor.fit_at
 
     def decide(self, now: float) -> tuple[str, str, bool] | None:
         """(rung, reason, skip) when the target should change, else None.

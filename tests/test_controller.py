@@ -37,12 +37,13 @@ def policy_with(ms_by_scale: dict[int, tuple[float, ...]]) -> DepthPolicy:
 FAST = {2: (5.0, 6.3, 7.6), 4: (8.1, 9.5, 10.9)}
 
 
-def feed_idle_link(monitor_or_controller, kbps: float, seconds: float = 2.0, fps: float = 30.0) -> float:
+def feed_idle_link(monitor_or_controller, kbps: float, seconds: float = 2.0, fps: float = 30.0,
+                   start: float = 0.0) -> float:
     """Packets at a quarter of the link rate, keyframes 4x larger; returns the end time."""
     observe = getattr(monitor_or_controller, 'observe_packet', None) or monitor_or_controller.add
-    t = 0.0
+    t = start
     for i in range(int(seconds * fps)):
-        t = i / fps
+        t = start + i / fps
         other = int(kbps * 1000 / 8 / fps / 4)
         size = 4 * other if i % 30 == 0 else other
         observe(t, t + 0.005 + size * 8 / (kbps * 1000), size, i % 30 == 0)
@@ -293,3 +294,23 @@ def test_loss_aware_default_caps_capacity_without_pricing_stalls():
     assert controller.stall_cost('x2@23') == 0
     assert controller.usable_capacity() == pytest.approx(0.5 * 1773, rel=1e-3)  # half the Mathis ceiling
     assert controller.rate(controller.current) <= 0.85 * 0.5 * 1773
+
+
+def test_stale_capacity_is_withdrawn_so_the_guard_cannot_lock_on_it():
+    """After a stall only keyframes get through (the guard skips the rest of each
+    group); one packet a second measures nothing, so the old estimate must expire."""
+    controller = TradeoffController(TABLE, LADDER, 1 / 30, 0.125, policy=policy_with(FAST))
+    controller.start('x4@28', 0.0)
+    end = feed_idle_link(controller, 1500)
+    controller.decide(end)
+    assert controller.fresh_capacity(end) == pytest.approx(1500, rel=1e-6)
+    t = end
+    for second in range(1, 6):  # keyframes alone, one a second, on an idle link
+        t = end + second
+        controller.observe_packet(t, t + 0.02, 4000, True)
+        controller.decide(t + 0.02)
+    assert controller.capacity is not None  # the controller keeps its last estimate
+    assert controller.fresh_capacity(t + 0.02) is None  # but does not offer it to the guard
+    resumed = feed_idle_link(controller, 1500, start=t + 1)  # packets flow again: measured afresh
+    controller.decide(resumed)
+    assert controller.fresh_capacity(resumed) == pytest.approx(1500, rel=1e-3)
